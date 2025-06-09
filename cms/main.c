@@ -2,6 +2,7 @@
  * Copyright(c) 2010-2016 Intel Corporation
  */
 
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +86,7 @@ static struct port_pair_params port_pair_params_array[RTE_MAX_ETHPORTS / 2];
 static struct port_pair_params *port_pair_params;
 static uint16_t nb_port_pair_params;
 
-static unsigned int cms_rx_queue_per_lcore = 1;
+static unsigned int cms_rx_queue_per_lcore = 2;
 
 #define MAX_RX_QUEUE_PER_LCORE 16
 #define MAX_TX_QUEUE_PER_PORT 16
@@ -131,6 +132,11 @@ print_stats(void)
 	total_packets_tx = 0;
 	total_packets_rx = 0;
 
+	/* Static variables to store previous statistics */
+	static uint64_t prev_tx[RTE_MAX_ETHPORTS] = {0};
+	static uint64_t prev_rx[RTE_MAX_ETHPORTS] = {0};
+	static uint64_t prev_dropped[RTE_MAX_ETHPORTS] = {0};
+
 	const char clr[] = { 27, '[', '2', 'J', '\0' };
 	const char topLeft[] = { 27, '[', '1', ';', '1', 'H','\0' };
 
@@ -143,18 +149,29 @@ print_stats(void)
 		/* skip disabled ports */
 		if ((cms_enabled_port_mask & (1 << portid)) == 0)
 			continue;
-		printf("\nStatistics for port %u ------------------------------"
-			   "\nPackets sent: %24"PRIu64
-			   "\nPackets received: %20"PRIu64
-			   "\nPackets dropped: %21"PRIu64,
-			   portid,
-			   port_statistics[portid].tx,
-			   port_statistics[portid].rx,
-			   port_statistics[portid].dropped);
+
+		uint64_t diff_tx = port_statistics[portid].tx - prev_tx[portid];
+		uint64_t diff_rx = port_statistics[portid].rx - prev_rx[portid];
+		uint64_t diff_dropped =
+		port_statistics[portid].dropped - prev_dropped[portid];
+
+
+    printf("\nStatistics for port %u ------------------------------"
+           "\nPackets sent:     %'14llu (diff: %'llu)"
+           "\nPackets received: %'14llu (diff: %'llu)"
+           "\nPackets dropped:  %'14llu (diff: %'llu)\n",
+           portid,
+           (unsigned long long)port_statistics[portid].tx, (unsigned long long)diff_tx,
+           (unsigned long long)port_statistics[portid].rx, (unsigned long long)diff_rx,
+           (unsigned long long)port_statistics[portid].dropped, (unsigned long long)diff_dropped);
 
 		total_packets_dropped += port_statistics[portid].dropped;
 		total_packets_tx += port_statistics[portid].tx;
 		total_packets_rx += port_statistics[portid].rx;
+		/* Update previous statistics */
+		prev_tx[portid] = port_statistics[portid].tx;
+		prev_rx[portid] = port_statistics[portid].rx;
+		prev_dropped[portid] = port_statistics[portid].dropped;
 	}
 	printf("\nAggregate statistics ==============================="
 		   "\nTotal packets sent: %18"PRIu64
@@ -302,7 +319,7 @@ cms_main_loop(void)
 		 * Read packet from RX queues
 		 */
 		for (i = 0; i < qconf->n_rx_port; i++) {
-
+			// printf("lcore %u: reading port %u\n", lcore_id, i);
 			portid = qconf->rx_port_list[i];
 			nb_rx = rte_eth_rx_burst(portid, 0,
 						 pkts_burst, MAX_PKT_BURST);
@@ -674,6 +691,8 @@ main(int argc, char **argv)
 	unsigned int nb_lcores = 0;
 	unsigned int nb_mbufs;
 
+	setlocale(LC_NUMERIC, "");  // Usa locale di sistema per i separatori
+
 	/* init EAL */
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -812,6 +831,7 @@ main(int argc, char **argv)
 		if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
 			local_port_conf.txmode.offloads |=
 				DEV_TX_OFFLOAD_MBUF_FAST_FREE;
+		//modificare per mettere più code
 		ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n",
@@ -831,6 +851,7 @@ main(int argc, char **argv)
 				 "Cannot get MAC address: err=%d, port=%u\n",
 				 ret, portid);
 
+		//for loop sulle varie code
 		/* init one RX queue */
 		fflush(stdout);
 		rxq_conf = dev_info.default_rxconf;
