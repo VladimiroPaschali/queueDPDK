@@ -1,62 +1,65 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright(c) 2010-2014 Intel Corporation
 
-# ====== CONFIGURAZIONE ======
+# binary name
 APP = cms
-SRCS = main.c
-BUILD_DIR = build
 
-# Path alla build statica DPDK (modifica se necessario)
-DPDK_BUILD = ../../dpdk-20.11/build
+# all source are stored in SRCS-y
+SRCS-y := main.c
 
-# Compilatore
-CC = gcc
+# Build using pkg-config variables if possible
+ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+$(error "no installation of DPDK found")
+endif
 
-# ====== SHARED MODE (pkg-config) ======
+#make local for local build using DPDK-20.11 source tree
+all: shared
+.PHONY: shared static local
+shared: build/$(APP)-shared
+	ln -sf $(APP)-shared build/$(APP)
+static: build/$(APP)-static
+	ln -sf $(APP)-static build/$(APP)
+local: build/$(APP)-local
+	ln -sf $(APP)-local build/$(APP)
+
 PKGCONF ?= pkg-config
+
 PC_FILE := $(shell $(PKGCONF) --path libdpdk 2>/dev/null)
-
-CFLAGS_SHARED = -O3 -g -DALLOW_EXPERIMENTAL_API \
-	$(shell $(PKGCONF) --cflags libdpdk) \
-	-DRTE_ETHDEV_PROFILE_WITH_VTUNE -DRTE_ETHDEV_RXTX_CALLBACKS
-
+CFLAGS += -O3 $(shell $(PKGCONF) --cflags libdpdk)
+# Add flag to allow experimental API as cms uses rte_ethdev_set_ptype API
+CFLAGS += -DALLOW_EXPERIMENTAL_API
 LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk)
+LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk)
 
-# ====== STATIC MODE (no install) ======
-CFLAGS_STATIC = -O3 -g -mssse3 -DALLOW_EXPERIMENTAL_API \
-	-I$(DPDK_BUILD)/include \
-	-DRTE_ETHDEV_PROFILE_WITH_VTUNE -DRTE_ETHDEV_RXTX_CALLBACKS
+build/$(APP)-shared: $(SRCS-y) Makefile $(PC_FILE) | build
+	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_SHARED)
 
-DPDK_LIBS_STATIC := $(wildcard $(DPDK_BUILD)/lib/*.a $(DPDK_BUILD)/drivers/*.a)
+build/$(APP)-static: $(SRCS-y) Makefile $(PC_FILE) | build
+	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_STATIC)
 
-LDFLAGS_STATIC = -Wl,--start-group $(DPDK_LIBS_STATIC) -Wl,--end-group \
-	-ldl -lm -pthread -lnuma
 
-# ====== REGOLE ======
+# Local build using DPDK-20.11 source tree
+DPDK_LOCAL_PATH ?= ../../dpdk-20.11
+DPDK_BUILD ?= $(DPDK_LOCAL_PATH)/build
 
-all: static
+DPDK_INCLUDES := -I$(DPDK_LOCAL_PATH) -I$(DPDK_BUILD)/include
+DPDK_LIBS := $(wildcard $(DPDK_BUILD)/lib/librte_*.a)
+# Exclude some drivers that are not needed for this application and may cause issues with the build process.
+EXCLUDED_DRIVERS := librte_net_mlx4.a librte_common_mlx5.a librte_vdpa_mlx5.a librte_regex_mlx5.a librte_net_mlx5.a
+DPDK_DRIVERS := $(filter-out $(addprefix $(DPDK_BUILD)/drivers/, $(EXCLUDED_DRIVERS)), $(wildcard $(DPDK_BUILD)/drivers/librte_*.a))
 
-.PHONY: shared static clean all
+CFLAGS_LOCAL += $(DPDK_INCLUDES) -DALLOW_EXPERIMENTAL_API -O3 -march=native
+LDFLAGS_LOCAL = -Wl,--as-needed -Wl,--no-undefined -Wl,-O1 \
+	-Wl,--whole-archive $(DPDK_LIBS) $(DPDK_DRIVERS) -Wl,--no-whole-archive \
+	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs
 
-shared: $(BUILD_DIR)/$(APP)-shared
-	ln -sf $(APP)-shared $(BUILD_DIR)/$(APP)
+build/$(APP)-local: $(SRCS-y) Makefile | build
+	$(CC) $(CFLAGS_LOCAL) $(SRCS-y) -o $@ $(LDFLAGS_LOCAL)
 
-static: $(BUILD_DIR)/$(APP)-static
-	ln -sf $(APP)-static $(BUILD_DIR)/$(APP)
-
-# Compilazione shared (con pkg-config)
-$(BUILD_DIR)/$(APP)-shared: $(SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_SHARED) $^ -o $@ $(LDFLAGS_SHARED)
-
-# Compilazione static (con librerie da build locale)
-$(BUILD_DIR)/$(APP)-static: $(SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_STATIC) $^ -o $@ $(LDFLAGS_STATIC)
-
-# Crea cartella build
-$(BUILD_DIR):
+build:
 	@mkdir -p $@
 
-# Pulizia
+.PHONY: clean
 clean:
-	rm -f $(BUILD_DIR)/$(APP) $(BUILD_DIR)/$(APP)-static $(BUILD_DIR)/$(APP)-shared
-	test -d $(BUILD_DIR) && rmdir $(BUILD_DIR) || true
+	rm -f build/$(APP) build/$(APP)-static build/$(APP)-shared
+	test -d build && rmdir -p build || true
