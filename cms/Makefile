@@ -1,43 +1,62 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright(c) 2010-2014 Intel Corporation
 
-# binary name
+# ====== CONFIGURAZIONE ======
 APP = cms
+SRCS = main.c
+BUILD_DIR = build
 
-# all source are stored in SRCS-y
-SRCS-y := main.c
+# Path alla build statica DPDK (modifica se necessario)
+DPDK_BUILD = ../../dpdk-20.11/build
 
-# Build using pkg-config variables if possible
-ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
-$(error "no installation of DPDK found")
-endif
+# Compilatore
+CC = gcc
 
-all: shared
-.PHONY: shared static
-shared: build/$(APP)-shared
-	ln -sf $(APP)-shared build/$(APP)
-static: build/$(APP)-static
-	ln -sf $(APP)-static build/$(APP)
-
+# ====== SHARED MODE (pkg-config) ======
 PKGCONF ?= pkg-config
-
 PC_FILE := $(shell $(PKGCONF) --path libdpdk 2>/dev/null)
-CFLAGS += -O3 $(shell $(PKGCONF) --cflags libdpdk)
-# Add flag to allow experimental API as cms uses rte_ethdev_set_ptype API
-CFLAGS += -DALLOW_EXPERIMENTAL_API
+
+CFLAGS_SHARED = -O3 -g -DALLOW_EXPERIMENTAL_API \
+	$(shell $(PKGCONF) --cflags libdpdk) \
+	-DRTE_ETHDEV_PROFILE_WITH_VTUNE -DRTE_ETHDEV_RXTX_CALLBACKS
+
 LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk)
-LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk)
 
-build/$(APP)-shared: $(SRCS-y) Makefile $(PC_FILE) | build
-	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_SHARED)
+# ====== STATIC MODE (no install) ======
+CFLAGS_STATIC = -O3 -g -mssse3 -DALLOW_EXPERIMENTAL_API \
+	-I$(DPDK_BUILD)/include \
+	-DRTE_ETHDEV_PROFILE_WITH_VTUNE -DRTE_ETHDEV_RXTX_CALLBACKS
 
-build/$(APP)-static: $(SRCS-y) Makefile $(PC_FILE) | build
-	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_STATIC)
+DPDK_LIBS_STATIC := $(wildcard $(DPDK_BUILD)/lib/*.a $(DPDK_BUILD)/drivers/*.a)
 
-build:
+LDFLAGS_STATIC = -Wl,--start-group $(DPDK_LIBS_STATIC) -Wl,--end-group \
+	-ldl -lm -pthread -lnuma
+
+# ====== REGOLE ======
+
+all: static
+
+.PHONY: shared static clean all
+
+shared: $(BUILD_DIR)/$(APP)-shared
+	ln -sf $(APP)-shared $(BUILD_DIR)/$(APP)
+
+static: $(BUILD_DIR)/$(APP)-static
+	ln -sf $(APP)-static $(BUILD_DIR)/$(APP)
+
+# Compilazione shared (con pkg-config)
+$(BUILD_DIR)/$(APP)-shared: $(SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_SHARED) $^ -o $@ $(LDFLAGS_SHARED)
+
+# Compilazione static (con librerie da build locale)
+$(BUILD_DIR)/$(APP)-static: $(SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_STATIC) $^ -o $@ $(LDFLAGS_STATIC)
+
+# Crea cartella build
+$(BUILD_DIR):
 	@mkdir -p $@
 
-.PHONY: clean
+# Pulizia
 clean:
-	rm -f build/$(APP) build/$(APP)-static build/$(APP)-shared
-	test -d build && rmdir -p build || true
+	rm -f $(BUILD_DIR)/$(APP) $(BUILD_DIR)/$(APP)-static $(BUILD_DIR)/$(APP)-shared
+	test -d $(BUILD_DIR) && rmdir $(BUILD_DIR) || true
