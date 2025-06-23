@@ -41,8 +41,9 @@
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
 #include "xxhash64.h"
-#define HASHFN_N 4
+#define HASHFN_N 20
 #define COLUMNS 1048576
+// #define COLUMNS 64
 struct countmin {
   uint64_t **values;
 };
@@ -204,15 +205,15 @@ cms_mac_updating(struct rte_mbuf *m, unsigned dest_portid)
 static void count_add(struct rte_mbuf *m) {
   struct rte_ether_hdr *eth;
   eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-  uint64_t h = xxhash64((const char *)eth + 12, 16, 0);
-  uint16_t hashes[4];
-  hashes[0] = (h & 0xFFFF);
-  hashes[1] = h >> 16 & 0xFFFF;
-  hashes[2] = h >> 32 & 0xFFFF;
-  hashes[3] = h >> 48 & 0xFFFF;
+//   uint16_t hashes[4];
+//   hashes[0] = (h & 0xFFFF);
+//   hashes[1] = h >> 16 & 0xFFFF;
+//   hashes[2] = h >> 32 & 0xFFFF;
+//   hashes[3] = h >> 48 & 0xFFFF;
 
-  for (int i = 0; i < 4; i++) {
-    uint32_t target_idx = hashes[i] & (COLUMNS - 1);
+  for (int i = 0; i < HASHFN_N; i++) {
+	uint64_t h = xxhash64((const char *)eth + 12, 16, i);
+    uint32_t target_idx =h & (COLUMNS - 1);
     cm->values[i][target_idx]++;
   }
 
