@@ -55,7 +55,6 @@
 // #define COLUMNS 64
 struct countmin {
 	uint64_t **values;
-	uint64_t **values;
 };
 
 struct countmin *cm;
@@ -162,8 +161,6 @@ print_stats(void)
 
 	const char clr[]     = {27, '[', '2', 'J', '\0'};
 	const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
-	const char clr[]     = {27, '[', '2', 'J', '\0'};
-	const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
 
 	/* Clear screen and move to top left */
 	/* Clear screen and move to top left */
@@ -230,7 +227,6 @@ cms_mac_updating(struct rte_mbuf *m, unsigned dest_portid)
 {
 	struct rte_ether_hdr *eth;
 	void                 *tmp;
-	void                 *tmp;
 
 	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
@@ -243,16 +239,6 @@ cms_mac_updating(struct rte_mbuf *m, unsigned dest_portid)
 	rte_ether_addr_copy(&cms_ports_eth_addr[dest_portid], &eth->s_addr);
 }
 
-static void
-count_add(struct rte_mbuf *m)
-{
-	struct rte_ether_hdr *eth;
-	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-	//   uint16_t hashes[4];
-	//   hashes[0] = (h & 0xFFFF);
-	//   hashes[1] = h >> 16 & 0xFFFF;
-	//   hashes[2] = h >> 32 & 0xFFFF;
-	//   hashes[3] = h >> 48 & 0xFFFF;
 static void
 count_add(struct rte_mbuf *m)
 {
@@ -284,8 +270,6 @@ cms_simple_forward(struct rte_mbuf *m, unsigned portid)
 {
 	unsigned                      dst_port;
 	int                           sent;
-	unsigned                      dst_port;
-	int                           sent;
 	struct rte_eth_dev_tx_buffer *buffer;
 
 	dst_port = cms_dst_ports[portid];
@@ -310,14 +294,7 @@ cms_main_loop(void)
 	unsigned                 lcore_id;
 	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc;
 	unsigned                 i, j, portid, nb_rx;
-	struct rte_mbuf         *pkts_burst[MAX_PKT_BURST];
-	struct rte_mbuf         *m;
-	int                      sent;
-	unsigned                 lcore_id;
-	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc;
-	unsigned                 i, j, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
-	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 	struct rte_eth_dev_tx_buffer *buffer;
 
@@ -442,7 +419,6 @@ static int
 cms_parse_portmask(const char *portmask)
 {
 	char         *end = NULL;
-	char         *end = NULL;
 	unsigned long pm;
 
 	/* parse hexadecimal string */
@@ -457,14 +433,7 @@ static int
 cms_parse_port_pair_config(const char *q_arg)
 {
 	enum fieldnames { FLD_PORT1 = 0, FLD_PORT2, _NUM_FLD };
-	enum fieldnames { FLD_PORT1 = 0, FLD_PORT2, _NUM_FLD };
 	unsigned long int_fld[_NUM_FLD];
-	const char   *p, *p0 = q_arg;
-	char         *str_fld[_NUM_FLD];
-	unsigned int  size;
-	char          s[256];
-	char         *end;
-	int           i;
 	const char   *p, *p0 = q_arg;
 	char         *str_fld[_NUM_FLD];
 	unsigned int  size;
@@ -487,24 +456,17 @@ cms_parse_port_pair_config(const char *q_arg)
 		memcpy(s, p, size);
 		s[size] = '\0';
 		if (rte_strsplit(s, sizeof(s), str_fld, _NUM_FLD, ',') != _NUM_FLD)
-		if (rte_strsplit(s, sizeof(s), str_fld, _NUM_FLD, ',') != _NUM_FLD)
 			return -1;
 		for (i = 0; i < _NUM_FLD; i++) {
 			errno      = 0;
-			errno      = 0;
 			int_fld[i] = strtoul(str_fld[i], &end, 0);
-			if (errno != 0 || end == str_fld[i] || int_fld[i] >= RTE_MAX_ETHPORTS)
 			if (errno != 0 || end == str_fld[i] || int_fld[i] >= RTE_MAX_ETHPORTS)
 				return -1;
 		}
 		if (nb_port_pair_params >= RTE_MAX_ETHPORTS / 2) {
 			printf("exceeded max number of port pair params: %hu\n", nb_port_pair_params);
-		if (nb_port_pair_params >= RTE_MAX_ETHPORTS / 2) {
-			printf("exceeded max number of port pair params: %hu\n", nb_port_pair_params);
 			return -1;
 		}
-		port_pair_params_array[nb_port_pair_params].port[0] = (uint16_t)int_fld[FLD_PORT1];
-		port_pair_params_array[nb_port_pair_params].port[1] = (uint16_t)int_fld[FLD_PORT2];
 		port_pair_params_array[nb_port_pair_params].port[0] = (uint16_t)int_fld[FLD_PORT1];
 		port_pair_params_array[nb_port_pair_params].port[1] = (uint16_t)int_fld[FLD_PORT2];
 		++nb_port_pair_params;
@@ -516,7 +478,6 @@ cms_parse_port_pair_config(const char *q_arg)
 static unsigned int
 cms_parse_nqueue(const char *q_arg)
 {
-	char         *end = NULL;
 	char         *end = NULL;
 	unsigned long n;
 
@@ -537,7 +498,6 @@ cms_parse_timer_period(const char *q_arg)
 {
 	char *end = NULL;
 	int   n;
-	int   n;
 
 	/* parse number string */
 	n = strtol(q_arg, &end, 10);
@@ -549,10 +509,6 @@ cms_parse_timer_period(const char *q_arg)
 	return n;
 }
 
-static const char short_options[] = "p:" /* portmask */
-                                    "q:" /* number of queues */
-                                    "T:" /* timer period */
-    ;
 static const char short_options[] = "p:" /* portmask */
                                     "q:" /* number of queues */
                                     "T:" /* timer period */
@@ -576,20 +532,13 @@ static const struct option lgopts[] = {
     {CMD_LINE_OPT_NO_MAC_UPDATING, no_argument, &mac_updating, 0},
     {CMD_LINE_OPT_PORTMAP_CONFIG, 1, 0, CMD_LINE_OPT_PORTMAP_NUM},
     {NULL, 0, 0, 0}};
-    {CMD_LINE_OPT_MAC_UPDATING, no_argument, &mac_updating, 1},
-    {CMD_LINE_OPT_NO_MAC_UPDATING, no_argument, &mac_updating, 0},
-    {CMD_LINE_OPT_PORTMAP_CONFIG, 1, 0, CMD_LINE_OPT_PORTMAP_NUM},
-    {NULL, 0, 0, 0}};
 
 /* Parse the argument given in the command line of the application */
 static int
 cms_parse_args(int argc, char **argv)
 {
 	int    opt, ret, timer_secs;
-	int    opt, ret, timer_secs;
 	char **argvopt;
-	int    option_index;
-	char  *prgname = argv[0];
 	int    option_index;
 	char  *prgname = argv[0];
 
@@ -598,8 +547,6 @@ cms_parse_args(int argc, char **argv)
 	port_pair_params = NULL;
 
 	while ((opt = getopt_long(argc, argvopt, short_options, lgopts, &option_index)) != EOF) {
-	while ((opt = getopt_long(argc, argvopt, short_options, lgopts, &option_index)) != EOF) {
-
 		switch (opt) {
 		/* portmask */
 		case 'p':
@@ -650,8 +597,6 @@ cms_parse_args(int argc, char **argv)
 
 	if (optind >= 0)
 		argv[optind - 1] = prgname;
-		argv[optind - 1] = prgname;
-
 	ret    = optind - 1;
 	ret    = optind - 1;
 	optind = 1; /* reset getopt lib */
@@ -667,13 +612,11 @@ check_port_pair_config(void)
 {
 	uint32_t port_pair_config_mask = 0;
 	uint32_t port_pair_mask        = 0;
-	uint32_t port_pair_mask        = 0;
 	uint16_t index, i, portid;
 
 	for (index = 0; index < nb_port_pair_params; index++) {
 		port_pair_mask = 0;
 
-		for (i = 0; i < NUM_PORTS; i++) {
 		for (i = 0; i < NUM_PORTS; i++) {
 			portid = port_pair_params[index].port[i];
 			if ((cms_enabled_port_mask & (1 << portid)) == 0) {
@@ -710,12 +653,7 @@ check_all_ports_link_status(uint32_t port_mask)
 #define MAX_CHECK_TIME 90  /* 9s (90 * 100ms) in total */
 	uint16_t            portid;
 	uint8_t             count, all_ports_up, print_flag = 0;
-#define MAX_CHECK_TIME 90  /* 9s (90 * 100ms) in total */
-	uint16_t            portid;
-	uint8_t             count, all_ports_up, print_flag = 0;
 	struct rte_eth_link link;
-	int                 ret;
-	char                link_status_text[RTE_ETH_LINK_MAX_STR_LEN];
 	int                 ret;
 	char                link_status_text[RTE_ETH_LINK_MAX_STR_LEN];
 
@@ -725,8 +663,6 @@ check_all_ports_link_status(uint32_t port_mask)
 		if (force_quit)
 			return;
 		all_ports_up = 1;
-		RTE_ETH_FOREACH_DEV(portid)
-		{
 		RTE_ETH_FOREACH_DEV(portid)
 		{
 			if (force_quit)
@@ -739,13 +675,10 @@ check_all_ports_link_status(uint32_t port_mask)
 				all_ports_up = 0;
 				if (print_flag == 1)
 					printf("Port %u link get failed: %s\n", portid, rte_strerror(-ret));
-					printf("Port %u link get failed: %s\n", portid, rte_strerror(-ret));
 				continue;
 			}
 			/* print link status if flag set */
 			if (print_flag == 1) {
-				rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
-				printf("Port %d %s\n", portid, link_status_text);
 				rte_eth_link_to_str(link_status_text, sizeof(link_status_text), &link);
 				printf("Port %d %s\n", portid, link_status_text);
 				continue;
@@ -779,7 +712,6 @@ signal_handler(int signum)
 {
 	if (signum == SIGINT || signum == SIGTERM) {
 		printf("\n\nSignal %d received, preparing to exit...\n", signum);
-		printf("\n\nSignal %d received, preparing to exit...\n", signum);
 		force_quit = true;
 	}
 }
@@ -796,16 +728,7 @@ main(int argc, char **argv)
 	unsigned                 nb_ports_in_mask = 0;
 	unsigned int             nb_lcores        = 0;
 	unsigned int             nb_mbufs;
-	int                      ret;
-	uint16_t                 nb_ports;
-	uint16_t                 nb_ports_available = 0;
-	uint16_t                 portid, last_port;
-	unsigned                 lcore_id, rx_lcore_id;
-	unsigned                 nb_ports_in_mask = 0;
-	unsigned int             nb_lcores        = 0;
-	unsigned int             nb_mbufs;
 
-	setlocale(LC_NUMERIC, ""); // Usa locale di sistema per i separatori
 	setlocale(LC_NUMERIC, ""); // Usa locale di sistema per i separatori
 
 	/* init EAL */
@@ -841,7 +764,6 @@ main(int argc, char **argv)
 	/* check port mask to possible port mask */
 	if (cms_enabled_port_mask & ~((1 << nb_ports) - 1))
 		rte_exit(EXIT_FAILURE, "Invalid portmask; possible (0x%x)\n", (1 << nb_ports) - 1);
-		rte_exit(EXIT_FAILURE, "Invalid portmask; possible (0x%x)\n", (1 << nb_ports) - 1);
 
 	/* reset cms_dst_ports */
 	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++)
@@ -856,13 +778,8 @@ main(int argc, char **argv)
 			p                     = idx & 1;
 			portid                = port_pair_params[idx >> 1].port[p];
 			cms_dst_ports[portid] = port_pair_params[idx >> 1].port[p ^ 1];
-			p                     = idx & 1;
-			portid                = port_pair_params[idx >> 1].port[p];
-			cms_dst_ports[portid] = port_pair_params[idx >> 1].port[p ^ 1];
 		}
 	} else {
-		RTE_ETH_FOREACH_DEV(portid)
-		{
 		RTE_ETH_FOREACH_DEV(portid)
 		{
 			/* skip ports that are not enabled */
@@ -870,7 +787,6 @@ main(int argc, char **argv)
 				continue;
 
 			if (nb_ports_in_mask % 2) {
-				cms_dst_ports[portid]    = last_port;
 				cms_dst_ports[portid]    = last_port;
 				cms_dst_ports[last_port] = portid;
 			} else {
@@ -887,11 +803,8 @@ main(int argc, char **argv)
 
 	rx_lcore_id = 0;
 	qconf       = NULL;
-	qconf       = NULL;
 
 	/* Initialize the port/queue configuration of each logical core */
-	RTE_ETH_FOREACH_DEV(portid)
-	{
 	RTE_ETH_FOREACH_DEV(portid)
 	{
 		/* skip ports that are not enabled */
@@ -900,7 +813,6 @@ main(int argc, char **argv)
 
 		/* get the lcore_id for this port */
 		while (rte_lcore_is_enabled(rx_lcore_id) == 0 ||
-		       lcore_queue_conf[rx_lcore_id].n_rx_port == cms_rx_queue_per_lcore) {
 		       lcore_queue_conf[rx_lcore_id].n_rx_port == cms_rx_queue_per_lcore) {
 			rx_lcore_id++;
 			if (rx_lcore_id >= RTE_MAX_LCORE)
@@ -916,27 +828,20 @@ main(int argc, char **argv)
 		qconf->rx_port_list[qconf->n_rx_port] = portid;
 		qconf->n_rx_port++;
 		printf("Lcore %u: RX port %u TX port %u\n", rx_lcore_id, portid, cms_dst_ports[portid]);
-		printf("Lcore %u: RX port %u TX port %u\n", rx_lcore_id, portid, cms_dst_ports[portid]);
 	}
 
-	nb_mbufs = RTE_MAX(
-	    cms_rx_queue_per_lcore * nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
+	nb_mbufs = RTE_MAX(cms_rx_queue_per_lcore * nb_ports *
+	                       (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE),
+	                   8192U);
 	printf("Creating mbuf pool with %u mbufs\n", nb_mbufs);
 
 	/* create the mbuf pool */
-	cms_pktmbuf_pool = rte_pktmbuf_pool_create(
-	    "mbuf_pool", nb_mbufs, MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	cms_pktmbuf_pool = rte_pktmbuf_pool_create(
 	    "mbuf_pool", nb_mbufs, MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (cms_pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 
 	/* Initialise each port */
-	RTE_ETH_FOREACH_DEV(portid)
-	{
-		struct rte_eth_rxconf   rxq_conf;
-		struct rte_eth_txconf   txq_conf;
-		struct rte_eth_conf     local_port_conf = port_conf;
 	RTE_ETH_FOREACH_DEV(portid)
 	{
 		struct rte_eth_rxconf   rxq_conf;
@@ -963,8 +868,8 @@ main(int argc, char **argv)
 			         strerror(-ret));
 
 		// local_port_conf.rxmode.mq_mode              = ETH_MQ_RX_RSS;
-		// local_port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP;
-		// local_port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
+		// local_port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IP |
+		// ETH_RSS_TCP | ETH_RSS_UDP;
 
 		// modificare per mettere più code
 		ret = rte_eth_dev_configure(portid, cms_rx_queue_per_lcore, 1, &local_port_conf);
@@ -1000,14 +905,11 @@ main(int argc, char **argv)
 		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd, &nb_txd);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
-			         "Cannot adjust number of descriptors: err=%d, port=%u\n",
-			         ret,
-			         portid);
-			         "Cannot adjust number of descriptors: err=%d, port=%u\n",
+			         "Cannot adjust number of descriptors: err=%d, "
+			         "port=%u\n",
 			         ret,
 			         portid);
 
-		ret = rte_eth_macaddr_get(portid, &cms_ports_eth_addr[portid]);
 		ret = rte_eth_macaddr_get(portid, &cms_ports_eth_addr[portid]);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot get MAC address: err=%d, port=%u\n", ret, portid);
@@ -1019,12 +921,9 @@ main(int argc, char **argv)
 			rte_exit(EXIT_FAILURE,
 			         "rte_pmd_qdma_get_queue_base : Querying of "
 			         "QUEUE_BASE failed\n");
-
-		// for loop sulle varie code
 		// for loop sulle varie code
 		/* init one RX queue */
 		fflush(stdout);
-		rxq_conf          = dev_info.default_rxconf;
 		rxq_conf          = dev_info.default_rxconf;
 		rxq_conf.offloads = local_port_conf.rxmode.offloads;
 
@@ -1077,7 +976,6 @@ main(int argc, char **argv)
 		ret = rte_eth_dev_start(portid);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_dev_start:err=%d, port=%u\n", ret, portid);
-			rte_exit(EXIT_FAILURE, "rte_eth_dev_start:err=%d, port=%u\n", ret, portid);
 
 		printf("done: \n");
 
@@ -1095,13 +993,6 @@ main(int argc, char **argv)
 		       cms_ports_eth_addr[portid].addr_bytes[3],
 		       cms_ports_eth_addr[portid].addr_bytes[4],
 		       cms_ports_eth_addr[portid].addr_bytes[5]);
-		       portid,
-		       cms_ports_eth_addr[portid].addr_bytes[0],
-		       cms_ports_eth_addr[portid].addr_bytes[1],
-		       cms_ports_eth_addr[portid].addr_bytes[2],
-		       cms_ports_eth_addr[portid].addr_bytes[3],
-		       cms_ports_eth_addr[portid].addr_bytes[4],
-		       cms_ports_eth_addr[portid].addr_bytes[5]);
 
 		/* initialize port stats */
 		memset(&port_statistics, 0, sizeof(port_statistics));
@@ -1109,13 +1000,10 @@ main(int argc, char **argv)
 
 	if (!nb_ports_available) {
 		rte_exit(EXIT_FAILURE, "All available ports are disabled. Please set portmask.\n");
-		rte_exit(EXIT_FAILURE, "All available ports are disabled. Please set portmask.\n");
 	}
 
 	// start
-	// start
 
-	cm         = rte_zmalloc(NULL, sizeof(struct countmin), 64);
 	cm         = rte_zmalloc(NULL, sizeof(struct countmin), 64);
 	cm->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
 	for (int i = 0; i < HASHFN_N; i++) {
@@ -1126,9 +1014,6 @@ main(int argc, char **argv)
 		for (int j = 0; j < COLUMNS; j++) {
 			cm->values[i][j] = 0;
 		}
-		for (int j = 0; j < COLUMNS; j++) {
-			cm->values[i][j] = 0;
-		}
 	}
 
 	check_all_ports_link_status(cms_enabled_port_mask);
@@ -1136,8 +1021,6 @@ main(int argc, char **argv)
 	ret = 0;
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(cms_launch_one_lcore, NULL, CALL_MAIN);
-	RTE_LCORE_FOREACH_WORKER(lcore_id)
-	{
 	RTE_LCORE_FOREACH_WORKER(lcore_id)
 	{
 		if (rte_eal_wait_lcore(lcore_id) < 0) {
@@ -1154,14 +1037,10 @@ main(int argc, char **argv)
 		for (int j = 0; j < COLUMNS; j++) {
 			fprintf(fp, "%lu\n", cm->values[i][j]);
 			// printf("%lu\n", cm->values[i][j]);
-			fprintf(fp, "%lu\n", cm->values[i][j]);
-			// printf("%lu\n", cm->values[i][j]);
 		}
 	}
 
 	fclose(fp);
-	RTE_ETH_FOREACH_DEV(portid)
-	{
 	RTE_ETH_FOREACH_DEV(portid)
 	{
 		if ((cms_enabled_port_mask & (1 << portid)) == 0)
@@ -1169,7 +1048,6 @@ main(int argc, char **argv)
 		printf("Closing port %d...", portid);
 		ret = rte_eth_dev_stop(portid);
 		if (ret != 0)
-			printf("rte_eth_dev_stop: err=%d, port=%d\n", ret, portid);
 			printf("rte_eth_dev_stop: err=%d, port=%d\n", ret, portid);
 		rte_eth_dev_close(portid);
 		printf(" Done\n");
