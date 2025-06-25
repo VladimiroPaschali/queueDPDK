@@ -101,8 +101,8 @@ static uint16_t                 nb_port_pair_params;
 
 static unsigned int cms_rx_queue_per_lcore = 2;
 
-#define MAX_RX_QUEUE_PER_LCORE 16
-#define MAX_TX_QUEUE_PER_PORT 16
+#define MAX_RX_QUEUE_PER_LCORE 2048
+#define MAX_TX_QUEUE_PER_PORT 2048
 struct lcore_queue_conf {
 	unsigned n_rx_port;
 	unsigned rx_port_list[MAX_RX_QUEUE_PER_LCORE];
@@ -143,6 +143,7 @@ struct cms_port_statistics port_statistics[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LC
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 10; /* default period is 10 seconds */
+uint32_t spin_time = 0;
 
 /* Print out statistics on packets dropped */
 static void
@@ -213,6 +214,7 @@ print_stats(void)
 	       (unsigned long long)(total_packets_rx - total_packets_rx_prev),
 	       (unsigned long long)total_packets_dropped,
 	       (unsigned long long)(total_packets_dropped - total_packets_dropped_prev));
+	printf("\nspin time: %u\n", spin_time);
 	printf("\n====================================================\n");
 	/* Reset previous statistics */
 	total_packets_tx_prev      = total_packets_tx;
@@ -358,15 +360,13 @@ cms_main_loop(void)
 
 			prev_tsc = cur_tsc;
 		}
-
 		/*
 		 * Read packet from RX queues
 		 */
 		for (i = 0; i < qconf->n_rx_port; i++) {
 			portid = qconf->rx_port_list[i];
 			for (int q = 0; q < cms_rx_queue_per_lcore; q++) {
-				nb_rx = rte_eth_rx_burst(portid, q, pkts_burst, MAX_PKT_BURST);
-				// if (nb_rx==0) spin_time[q]++;
+				nb_rx = rte_eth_rx_burst(portid, q, pkts_burst, MAX_PKT_BURST);			
 
 				port_statistics[portid][q].rx += nb_rx;
 
@@ -377,6 +377,11 @@ cms_main_loop(void)
 					rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 					count_add(m);
 					rte_pktmbuf_free(m);
+				}
+				if (nb_rx == MAX_PKT_BURST && cms_rx_queue_per_lcore > 1) {
+					q--; // if we got MAX_PKT_BURST packets, we need to process them again
+				}else {
+					spin_time++;
 				}
 			}
 		}
@@ -876,7 +881,7 @@ main(int argc, char **argv)
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n", ret, portid);
 
-		struct rte_eth_rss_reta_entry64 reta_conf[512 / RTE_RETA_GROUP_SIZE];
+		struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
 		int                             i, j;
 		// crea l'indir table con valori da 0 a cms_rx_queue_per_lcore
 		for (i = 0; i < dev_info.reta_size / RTE_RETA_GROUP_SIZE; i++) {
@@ -893,13 +898,6 @@ main(int argc, char **argv)
 			rte_exit(EXIT_FAILURE, "Cannot set RSS REA: err=%d, port=%u\n", ret, portid);
 
 		rte_eth_dev_rss_reta_query(portid, reta_conf, dev_info.reta_size);
-		// print reta_conf
-		for (i = 0; i < dev_info.reta_size / RTE_RETA_GROUP_SIZE; i++) {
-			printf("reta_conf[%d]: ", i);
-			for (j = 0; j < RTE_RETA_GROUP_SIZE; j++)
-				printf("%d ", reta_conf[i].reta[j]);
-			printf("\n");
-		}
 		cms_rx_queue_per_lcore = reta_conf[0].reta[0] + 1;
 		printf("cms_rx_queue_per_lcore: %d\n", cms_rx_queue_per_lcore);
 
