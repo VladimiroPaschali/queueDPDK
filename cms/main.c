@@ -884,7 +884,7 @@ main(int argc, char **argv)
 			reta_conf[i].mask = ~0LL;
 			for (j = 0; j < RTE_RETA_GROUP_SIZE; j++)
 				// da 0 a number of queues
-				reta_conf[i].reta[j] = (i * RTE_RETA_GROUP_SIZE + j) % cms_rx_queue_per_lcore;
+				reta_conf[i].reta[j] = 0;
 		}
 		// salva l'indir table sul device
 		ret = rte_eth_dev_rss_reta_update(portid, reta_conf, dev_info.reta_size);
@@ -900,6 +900,9 @@ main(int argc, char **argv)
 				printf("%d ", reta_conf[i].reta[j]);
 			printf("\n");
 		}
+		cms_rx_queue_per_lcore = reta_conf[0].reta[0] + 1;
+		printf("cms_rx_queue_per_lcore: %d\n", cms_rx_queue_per_lcore);
+
 		rte_eth_dev_info_get(portid, &dev_info);
 
 		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd, &nb_txd);
