@@ -131,7 +131,6 @@ static struct rte_eth_conf port_conf = {
 };
 
 struct rte_mempool *cms_pktmbuf_pool = NULL;
-#define RTE_TEST_RX_DESC_DEFAULT 1024
 /* Per-port statistics struct */
 struct cms_port_statistics {
 	uint64_t tx;
@@ -144,6 +143,7 @@ struct cms_port_statistics port_statistics[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LC
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 10; /* default period is 10 seconds */
 uint32_t spin_time = 0;
+bool aggressive = false; /* aggressive mode disabled by default */
 
 /* Print out statistics on packets dropped */
 static void
@@ -163,7 +163,6 @@ print_stats(void)
 	const char clr[]     = {27, '[', '2', 'J', '\0'};
 	const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
 
-	/* Clear screen and move to top left */
 	/* Clear screen and move to top left */
 	printf("%s%s", clr, topLeft);
 
@@ -215,6 +214,8 @@ print_stats(void)
 	       (unsigned long long)total_packets_dropped,
 	       (unsigned long long)(total_packets_dropped - total_packets_dropped_prev));
 	printf("\nspin time: %u\n", spin_time);
+	if (aggressive) printf("With aggressive policy\n");
+	else            printf("Without aggressive policy\n");
 	printf("\n====================================================\n");
 	/* Reset previous statistics */
 	total_packets_tx_prev      = total_packets_tx;
@@ -254,12 +255,8 @@ count_add(struct rte_mbuf *m)
 
 	for (int i = 0; i < HASHFN_N; i++) {
 		uint64_t h          = xxhash64((const char *)eth + 12, 16, i);
-		uint32_t target_idx = h & (COLUMNS - 1);
-		cm->values[i][target_idx]++;
-	}
-	for (int i = 0; i < HASHFN_N; i++) {
-		uint64_t h          = xxhash64((const char *)eth + 12, 16, i);
-		uint32_t target_idx = h & (COLUMNS - 1);
+		uint32_t target_idx = h & (16 - 1);
+		// uint32_t target_idx = h & (COLUMNS - 1);
 		cm->values[i][target_idx]++;
 	}
 
@@ -281,7 +278,6 @@ cms_simple_forward(struct rte_mbuf *m, unsigned portid)
 
 	buffer = tx_buffer[dst_port];
 	sent   = rte_eth_tx_buffer(dst_port, 0, buffer, m);
-	sent   = rte_eth_tx_buffer(dst_port, 0, buffer, m);
 	if (sent)
 		port_statistics[dst_port][0].tx += sent;
 }
@@ -300,7 +296,6 @@ cms_main_loop(void)
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
 	struct rte_eth_dev_tx_buffer *buffer;
 
-	prev_tsc  = 0;
 	prev_tsc  = 0;
 	timer_tsc = 0;
 
@@ -376,13 +371,14 @@ cms_main_loop(void)
 					m = pkts_burst[j];
 					rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 					count_add(m);
+					// cms_simple_forward(m, portid);
 					rte_pktmbuf_free(m);
 				}
-				if (nb_rx == MAX_PKT_BURST && cms_rx_queue_per_lcore > 1) {
+				if (aggressive && nb_rx == MAX_PKT_BURST && cms_rx_queue_per_lcore > 1) {
 					q--; // if we got MAX_PKT_BURST packets, we need to process them again
-				}else {
-					spin_time++;
-				}
+				}// else {
+				//	spin_time++;
+				//}
 			}
 		}
 	}
@@ -400,6 +396,7 @@ static void
 cms_usage(const char *prgname)
 {
 	printf("%s [EAL options] -- -p PORTMASK [-q NQ]\n"
+	       "  -a: enable aggressive policy\n"
 	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
 	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
 	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to "
@@ -514,7 +511,8 @@ cms_parse_timer_period(const char *q_arg)
 	return n;
 }
 
-static const char short_options[] = "p:" /* portmask */
+static const char short_options[] = "a"  /* agressive */
+                                    "p:" /* portmask  */
                                     "q:" /* number of queues */
                                     "T:" /* timer period */
     ;
@@ -553,6 +551,9 @@ cms_parse_args(int argc, char **argv)
 
 	while ((opt = getopt_long(argc, argvopt, short_options, lgopts, &option_index)) != EOF) {
 		switch (opt) {
+		case 'a':
+			aggressive = true;
+			break;
 		/* portmask */
 		case 'p':
 			cms_enabled_port_mask = cms_parse_portmask(optarg);
