@@ -1,2 +1,5 @@
 *.txt
 *build/
+*__pycache__
+*.pyc
+*.venv

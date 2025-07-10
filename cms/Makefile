@@ -53,6 +53,18 @@ LDFLAGS_LOCAL = -Wl,--as-needed -Wl,--no-undefined -Wl,-O1 \
 	-Wl,--whole-archive $(DPDK_LIBS) $(DPDK_DRIVERS) -Wl,--no-whole-archive \
 	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs
 
+# CFLAGS_LOCAL += $(DPDK_INCLUDES) \
+#   -DALLOW_EXPERIMENTAL_API \
+#   -DRTE_ETHDEV_PROFILE_WITH_VTUNE \
+#   -DCONFIG_RTE_ETHDEV_RXTX_CALLBACKS \
+#   -g -O1 -march=native
+
+# LDFLAGS_LOCAL = \
+#   -Wl,--as-needed -Wl,--no-undefined -Wl,-O1 \
+#   -Wl,--whole-archive $(DPDK_LIBS) $(DPDK_DRIVERS) -Wl,--no-whole-archive \
+#   -pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs
+
+
 build/$(APP)-local: $(SRCS-y) Makefile | build
 	$(CC) $(CFLAGS_LOCAL) $(SRCS-y) -o $@ $(LDFLAGS_LOCAL)
 
@@ -61,5 +73,5 @@ build:
 
 .PHONY: clean
 clean:
-	rm -f build/$(APP) build/$(APP)-static build/$(APP)-shared
+	rm -rdf build
 	test -d build && rmdir -p build || true

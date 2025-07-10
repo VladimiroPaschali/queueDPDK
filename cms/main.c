@@ -50,9 +50,9 @@
 #include <sys/queue.h>
 #include <sys/types.h>
 
-#define HASHFN_N 20
+#define HASHFN_N 40
 #define COLUMNS 1048576
-// #define COLUMNS 64
+//#define COLUMNS 1024
 struct countmin {
 	uint64_t **values;
 };
@@ -144,6 +144,8 @@ struct cms_port_statistics port_statistics[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LC
 static uint64_t timer_period = 10; /* default period is 10 seconds */
 uint32_t spin_time = 0;
 bool aggressive = false; /* aggressive mode disabled by default */
+static unsigned prefetch_distance = 4; /* prefetch distance for mbufs in burst */
+uint32_t cms_columns = COLUMNS; /* number of columns in the count-min sketch */
 
 /* Print out statistics on packets dropped */
 static void
@@ -216,6 +218,7 @@ print_stats(void)
 	printf("\nspin time: %u\n", spin_time);
 	if (aggressive) printf("With aggressive policy\n");
 	else            printf("Without aggressive policy\n");
+	printf("prefetch distance: %u\n", prefetch_distance);
 	printf("\n====================================================\n");
 	/* Reset previous statistics */
 	total_packets_tx_prev      = total_packets_tx;
@@ -252,16 +255,12 @@ count_add(struct rte_mbuf *m)
 	//   hashes[1] = h >> 16 & 0xFFFF;
 	//   hashes[2] = h >> 32 & 0xFFFF;
 	//   hashes[3] = h >> 48 & 0xFFFF;
-
 	for (int i = 0; i < HASHFN_N; i++) {
 		uint64_t h          = xxhash64((const char *)eth + 12, 16, i);
-		uint32_t target_idx = h & (16 - 1);
-		// uint32_t target_idx = h & (COLUMNS - 1);
+		uint32_t target_idx = h & (cms_columns - 1);
 		cm->values[i][target_idx]++;
+		//spin_time +=h;
 	}
-
-	// free buffer
-	// free buffer
 }
 
 static void
@@ -369,12 +368,15 @@ cms_main_loop(void)
 				for (j = 0; j < nb_rx; j++) {
 					// printf("lcore %u: port %u, queue %d, packet %d\n", lcore_id, portid, q, j);
 					m = pkts_burst[j];
-					rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+					//rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+					if (j+prefetch_distance < nb_rx) {
+						rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + prefetch_distance], void *));
+					}
 					count_add(m);
 					// cms_simple_forward(m, portid);
 					rte_pktmbuf_free(m);
 				}
-				if (aggressive && nb_rx == MAX_PKT_BURST && cms_rx_queue_per_lcore > 1) {
+				if (aggressive && nb_rx == MAX_PKT_BURST) {
 					q--; // if we got MAX_PKT_BURST packets, we need to process them again
 				}// else {
 				//	spin_time++;
@@ -396,8 +398,11 @@ static void
 cms_usage(const char *prgname)
 {
 	printf("%s [EAL options] -- -p PORTMASK [-q NQ]\n"
-	       "  -a: enable aggressive policy\n"
-	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
+		   "  -d N: number of descriptors > 32 (default is 1024)\n"
+		   "  -p N: prefetch distance\n"
+		   "  -c N: configure number of columns (default is 1048576)\n"
+	       "  -a enable aggressive policy\n"
+	       "  -P PORTMASK: hexadecimal bitmask of ports to configure\n"
 	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
 	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to "
 	       "disable, 10 default, 86400 maximum)\n"
@@ -511,10 +516,13 @@ cms_parse_timer_period(const char *q_arg)
 	return n;
 }
 
-static const char short_options[] = "a"  /* agressive */
-                                    "p:" /* portmask  */
+static const char short_options[] = "c:"  /* columns  */
+				    				"a"  /* agressive */
+                                    "P:" /* portmask  */
                                     "q:" /* number of queues */
                                     "T:" /* timer period */
+									"p:" /* prefetch distance */
+									"d:" /* number of descriptors */
     ;
 
 #define CMD_LINE_OPT_MAC_UPDATING "mac-updating"
@@ -551,11 +559,33 @@ cms_parse_args(int argc, char **argv)
 
 	while ((opt = getopt_long(argc, argvopt, short_options, lgopts, &option_index)) != EOF) {
 		switch (opt) {
+		case 'c':
+			cms_columns = cms_parse_nqueue(optarg);
+			/* check that cms_columns is a power of 2 */
+			if (cms_columns == 0 || (cms_columns & (cms_columns - 1)) != 0) {
+				printf("invalid number of columns\n");
+				cms_usage(prgname);
+				return -1;
+			}
+			break;
+
+		case 'd':
+			nb_rxd = cms_parse_nqueue(optarg);
+			/* check that descriptors is a power of 2 */
+			if (nb_rxd < 32 || (nb_rxd & (nb_rxd - 1)) != 0) {
+				printf("invalid number of descriptors\n");
+				cms_usage(prgname);
+				return -1;
+			}
+			break;
 		case 'a':
 			aggressive = true;
 			break;
-		/* portmask */
 		case 'p':
+			prefetch_distance = atoi(optarg);
+			break;
+		/* portmask */
+		case 'P':
 			cms_enabled_port_mask = cms_parse_portmask(optarg);
 			if (cms_enabled_port_mask == 0) {
 				printf("invalid portmask\n");
@@ -1009,11 +1039,11 @@ main(int argc, char **argv)
 	cm         = rte_zmalloc(NULL, sizeof(struct countmin), 64);
 	cm->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
 	for (int i = 0; i < HASHFN_N; i++) {
-		cm->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * COLUMNS, 64);
+		cm->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * cms_columns, 64);
 	}
 
 	for (int i = 0; i < HASHFN_N; i++) {
-		for (int j = 0; j < COLUMNS; j++) {
+		for (int j = 0; j < cms_columns; j++) {
 			cm->values[i][j] = 0;
 		}
 	}
@@ -1036,13 +1066,26 @@ main(int argc, char **argv)
 	FILE *fp;
 	fp = fopen("countmin.txt", "w");
 	for (int i = 0; i < HASHFN_N; i++) {
-		for (int j = 0; j < COLUMNS; j++) {
+		for (int j = 0; j < cms_columns; j++) {
 			fprintf(fp, "%lu\n", cm->values[i][j]);
 			// printf("%lu\n", cm->values[i][j]);
 		}
 	}
-
 	fclose(fp);
+
+	
+	struct rte_eth_stats stats;
+	uint16_t port_id = 0;
+
+	if (rte_eth_stats_get(port_id, &stats) < 0) {
+	printf("Error getting stats for port %u\n", port_id);
+	return -1;
+
+	}
+	printf("RX packets: %" PRIu64 "\n", stats.ipackets);
+	printf("TX packets: %" PRIu64 "\n", stats.opackets);
+	printf("RX dropped: %" PRIu64 "\n", stats.imissed);
+
 	RTE_ETH_FOREACH_DEV(portid)
 	{
 		if ((cms_enabled_port_mask & (1 << portid)) == 0)
