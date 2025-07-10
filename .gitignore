@@ -3,3 +3,6 @@
 *__pycache__
 *.pyc
 *.venv
+*results.csv
+*.log
+*.all_results.csv
