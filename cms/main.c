@@ -50,6 +50,8 @@
 #include <sys/queue.h>
 #include <sys/types.h>
 
+struct rte_eth_stats stats;
+uint16_t port_id = 0;
 #define HASHFN_N 40
 #define COLUMNS 1048576
 //#define COLUMNS 1024
@@ -146,8 +148,10 @@ uint32_t spin_time = 0;
 bool aggressive = false; /* aggressive mode disabled by default */
 static unsigned prefetch_distance = 4; /* prefetch distance for mbufs in burst */
 uint32_t cms_columns = COLUMNS; /* number of columns in the count-min sketch */
-
+bool after_warmup = false; /* reset statistics after warmup time */
 /* Print out statistics on packets dropped */
+uint64_t measured_packets_rx = 0;
+uint64_t measured_tick = 0;
 static void
 print_stats(void)
 {
@@ -183,7 +187,7 @@ print_stats(void)
 
 			if (diff_tx == 0 && diff_rx == 0 && diff_dropped == 0)
 				continue;
-			printf("\nStatistics for port %u queue: %d ------------------------------"
+			/*printf("\nStatistics for port %u queue: %d ------------------------------"
 			       "\nPackets sent:     %'20llu (diff: %'llu)"
 			       "\nPackets received: %'20llu (diff: %'llu)"
 			       "\nPackets dropped:  %'20llu (diff: %'llu)\n",
@@ -195,7 +199,7 @@ print_stats(void)
 			       (unsigned long long)diff_rx,
 			       (unsigned long long)port_statistics[portid][q].dropped,
 			       (unsigned long long)diff_dropped);
-
+			*/
 			total_packets_dropped += port_statistics[portid][q].dropped;
 			total_packets_tx += port_statistics[portid][q].tx;
 			total_packets_rx += port_statistics[portid][q].rx;
@@ -220,10 +224,16 @@ print_stats(void)
 	else            printf("Without aggressive policy\n");
 	printf("prefetch distance: %u\n", prefetch_distance);
 	printf("\n====================================================\n");
+	if (after_warmup) measured_packets_rx += (total_packets_rx - total_packets_rx_prev);
+	if (after_warmup) measured_tick++; 
 	/* Reset previous statistics */
 	total_packets_tx_prev      = total_packets_tx;
 	total_packets_rx_prev      = total_packets_rx;
 	total_packets_dropped_prev = total_packets_dropped;
+ 
+	if (rte_eth_stats_get(port_id, &stats) < 0) {
+	printf("Error getting stats for port %u\n", port_id);
+	}
 
 	fflush(stdout);
 }
@@ -289,7 +299,7 @@ cms_main_loop(void)
 	struct rte_mbuf         *m;
 	int                      sent;
 	unsigned                 lcore_id;
-	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc;
+	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc,end_time;
 	unsigned                 i, j, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
@@ -315,9 +325,13 @@ cms_main_loop(void)
 		RTE_LOG(INFO, CMS, " -- lcoreid=%u portid=%u\n", lcore_id, portid);
 	}
 
+	uint64_t start_time = rte_rdtsc();
+	uint64_t warmup_time = 3* rte_get_timer_hz(); 
+	uint64_t stop_time = (10* rte_get_timer_hz())+warmup_time; 
 	while (!force_quit) {
 
 		cur_tsc = rte_rdtsc();
+
 
 		/*
 		 * TX burst queue drain
@@ -357,6 +371,7 @@ cms_main_loop(void)
 		/*
 		 * Read packet from RX queues
 		 */
+		int max_loops = 100000;
 		for (i = 0; i < qconf->n_rx_port; i++) {
 			portid = qconf->rx_port_list[i];
 			for (int q = 0; q < cms_rx_queue_per_lcore; q++) {
@@ -376,12 +391,21 @@ cms_main_loop(void)
 					// cms_simple_forward(m, portid);
 					rte_pktmbuf_free(m);
 				}
-				if (aggressive && nb_rx == MAX_PKT_BURST) {
+				if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 					q--; // if we got MAX_PKT_BURST packets, we need to process them again
-				}// else {
-				//	spin_time++;
-				//}
+					max_loops--;
+				} else {
+					spin_time++;
+				}
 			}
+		}
+		if ((cur_tsc -start_time) > stop_time) { // 13 seconds) {
+			break;
+		}else if (cur_tsc - start_time > warmup_time) { // 3 seconds
+			//rte_eth_stats_reset(portid); // skip the first 3 seconds
+			after_warmup=true;
+			warmup_time = 1000 * rte_get_timer_hz(); // reset warmup time
+
 		}
 	}
 }
@@ -1060,9 +1084,13 @@ main(int argc, char **argv)
 			break;
 		}
 	}
+	printf("RX packets: %" PRIu64 "\n", stats.ipackets);
+	printf("TX packets: %" PRIu64 "\n", stats.opackets);
+	printf("RX dropped: %" PRIu64 "\n", stats.imissed);
+	//printf("measured RX: %" PRIu64 "\n", measured_packets_rx);
+	printf("measured RX: %.2f\n", (float)measured_packets_rx/measured_tick);
 
 	// save countmin in a file
-	printf("cm %p\n", cm);
 	FILE *fp;
 	fp = fopen("countmin.txt", "w");
 	for (int i = 0; i < HASHFN_N; i++) {
@@ -1073,18 +1101,6 @@ main(int argc, char **argv)
 	}
 	fclose(fp);
 
-	
-	struct rte_eth_stats stats;
-	uint16_t port_id = 0;
-
-	if (rte_eth_stats_get(port_id, &stats) < 0) {
-	printf("Error getting stats for port %u\n", port_id);
-	return -1;
-
-	}
-	printf("RX packets: %" PRIu64 "\n", stats.ipackets);
-	printf("TX packets: %" PRIu64 "\n", stats.opackets);
-	printf("RX dropped: %" PRIu64 "\n", stats.imissed);
 
 	RTE_ETH_FOREACH_DEV(portid)
 	{

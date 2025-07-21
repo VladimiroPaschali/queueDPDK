@@ -32,6 +32,7 @@ def _init_csv(csv_path: str, cfg_throughput: bool, cfg_perf: list) -> int:
     fields.append("queues")
     fields.append("descriptors")
     fields.append("cms")
+    fields.append("prefetch")
     fields.append("aggressive")
     if cfg_throughput:
         fields.append("throughput")
@@ -53,7 +54,7 @@ def _append_to_csv(csv_path: str, data: list) -> int:
 
 def _get_dpdk_throughput(dpdk_output) -> int:
 
-    match = re.search(r'RX packets:\s*(\d+)', dpdk_output)
+    match = re.search(r'measured RX:\s*(\d+)', dpdk_output)
     if match:
         rx_packets = int(match.group(1))
         print("RX packets:", rx_packets)
@@ -98,7 +99,7 @@ def parse_bw(output: str) -> float:
 
 def _get_bw(cfg_cpu, cfg_time, result_bw) -> int:
 
-    command = f"sudo pqos -m 'mbl:{cfg_cpu}' -t {int(cfg_time/2)}"
+    command = f"sudo pqos -m 'mbl:{cfg_cpu}' -t {int(cfg_time/4)}"
     # print("Running bandwidth command:", command)
     try:
         result = sp.run(shlex.split(command), capture_output=True, text=True, check=True)
@@ -111,7 +112,7 @@ def _get_bw(cfg_cpu, cfg_time, result_bw) -> int:
     result_bw["avg_bw"] = avg_bw
     return 0
 
-def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cfg_ifpci, cfg_app_args, cfg_queues, cfg_aggressive, cfg_descriptors, cfg_cms, cfg_per_pkt) -> int:
+def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cfg_ifpci, cfg_app_args, cfg_queues, cfg_prefetch, cfg_aggressive, cfg_descriptors, cfg_cms, cfg_per_pkt) -> int:
 
     #sudo perf stat -C 4 -e cycles,instructions,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,L1-dcache-stores,
     # l2_request.miss,l2_request.all,dTLB-loads,dTLB-load-misses,LLC-loads,LLC-load-misses,LLC-stores
@@ -122,7 +123,7 @@ def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cf
     perf_events = ",".join(cfg_perf)
 
     command = f"sudo perf stat -C {cfg_cpu} -e {perf_events} --timeout {perf_timeout} {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
-    command += f" -- {cfg_app_args} -q {cfg_queues} -d {cfg_descriptors} {aggressive} -c {cfg_cms} -p 1 "
+    command += f" -- {cfg_app_args} -q {cfg_queues} -d {cfg_descriptors} {aggressive} -c {cfg_cms} -p {cfg_prefetch}"
     # print(command)
 
     #lancia un thread diverso per calcolare la banda
@@ -150,7 +151,7 @@ def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cf
     throughput = _get_dpdk_throughput(result.stdout)
     if throughput <= 0:
         print("Error: Throughput is zero or negative")
-        return -1
+        throughput = 0
 
     if cfg_per_pkt:
         perf_data_per_pkt = {k: v/ throughput for k, v in perf_data.items()}
@@ -179,12 +180,8 @@ def run_suite(suite_cfg:json, name:str) -> int:
     cfg_per_pkt = suite_cfg["per-pkt"]
     cfg_programs = suite_cfg["progs"]
     cfg_cms = suite_cfg["cms"]
-    #if aggressive is 2 it means both aggressive and non-aggressive
-    cfg_aggressive = {
-        0: [False],
-        1: [True],
-        2: [True, False]
-    }.get(suite_cfg["aggressive"], [False])
+    cfg_aggressive = suite_cfg["aggressive"]
+    cfg_prefetch = suite_cfg["prefetch"]
     #clear csv and sets up fiels
     _init_csv(csvpath, cfg_throughput, cfg_perf)
     _init_csv(allcsvpath, cfg_throughput, cfg_perf)
@@ -202,7 +199,7 @@ def run_suite(suite_cfg:json, name:str) -> int:
     cfg_app_args = cfg_programs[0]["app-args"]
 
 
-    tot_iterations = cfg_repetitions * len(cfg_queues) * len(cfg_descriptors) * len(cfg_cms) * len(cfg_aggressive)
+    tot_iterations = cfg_repetitions * len(cfg_queues) * len(cfg_descriptors) * len(cfg_cms) * len(cfg_prefetch) * len(cfg_aggressive)
     tot_time = cfg_time * tot_iterations
 
     print(f"Total estimated time for the experiment: {tot_time} seconds (~{tot_time/60:.2f} minutes)")
@@ -212,33 +209,35 @@ def run_suite(suite_cfg:json, name:str) -> int:
         for queue in cfg_queues:
             for descriptor in cfg_descriptors:
                 for cms in cfg_cms:
-                    for aggressive in cfg_aggressive:
+                    for prefetch in cfg_prefetch:
+                        for aggressive in cfg_aggressive:
 
-                        csvdata.append(1)  # Repetition
-                        csvdata.append(cfg_programs[0]["name"])
-                        csvdata.append(queue)
-                        csvdata.append(descriptor)
-                        csvdata.append(cms)
-                        csvdata.append(aggressive)
+                            csvdata.append(1)  # Repetition
+                            csvdata.append(cfg_programs[0]["name"])
+                            csvdata.append(queue)
+                            csvdata.append(descriptor)
+                            csvdata.append(cms)
+                            csvdata.append(prefetch)
+                            csvdata.append(aggressive)
 
-                        print(f"Running program: {cfg_programs[0]['name']} with queues={queue}, descriptors={descriptor}, cms columns={cms}, aggressive={aggressive}")
+                            print(f"Running program: {cfg_programs[0]['name']} with queues={queue}, descriptors={descriptor}, cms columns={cms}, prefetch={prefetch}, aggressive={aggressive}")
 
-                        start_time = time.time()
+                            start_time = time.time()
 
-                        perf_data, throughput = _load_with_perf(
-                            cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
-                            cfg_dpdk_args, cfg_ifpci, cfg_app_args,
-                            queue, aggressive, descriptor, cms, cfg_per_pkt
-                        )
+                            perf_data, throughput = _load_with_perf(
+                                cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
+                                cfg_dpdk_args, cfg_ifpci, cfg_app_args,
+                                queue, prefetch, aggressive, descriptor, cms, cfg_per_pkt
+                            )
 
-                        csvdata.append(throughput)
-                        csvdata.extend(perf_data.values())
-                        _append_to_csv(csvpath, csvdata)
-                        csvdata.clear()
+                            csvdata.append(throughput)
+                            csvdata.extend(perf_data.values())
+                            _append_to_csv(csvpath, csvdata)
+                            csvdata.clear()
 
-                        pbar.update(1)
-                        elapsed = time.time() - start_time
-                        pbar.set_postfix({"Last run (s)": f"{elapsed:.1f}", "Throughput": f"{throughput:.1f}"})
+                            pbar.update(1)
+                            elapsed = time.time() - start_time
+                            pbar.set_postfix({"Last run (s)": f"{elapsed:.1f}", "Throughput": f"{throughput:.1f}"})
 
 
     return 0
