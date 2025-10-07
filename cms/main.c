@@ -147,7 +147,7 @@ static uint64_t timer_period      = 10; /* default period is 10 seconds */
 uint32_t        spin_time         = 0;
 uint32_t        miss              = 0;
 uint32_t        total             = 0;
-uint32_t        skipped           = 0;
+uint32_t        empty           = 0;
 bool            aggressive        = false;   /* aggressive mode disabled by default */
 static unsigned prefetch_distance = 4;       /* prefetch distance for mbufs in burst */
 uint32_t        cms_columns       = COLUMNS; /* number of columns in the count-min sketch */
@@ -224,7 +224,7 @@ print_stats(void)
 	       (unsigned long long)(total_packets_dropped - total_packets_dropped_prev));
 	printf("\nspin time: %u\n", spin_time);
 	printf("miss: %u\n", miss);
-	printf("skipped: %u\n", skipped);
+	printf("empty: %u\n", empty);
 	printf("total: %u\n", total);
 	if (aggressive)
 		printf("With aggressive policy\n");
@@ -335,7 +335,7 @@ cms_simple_forward(struct rte_mbuf *m, unsigned portid)
 	if (sent)
 		port_statistics[dst_port][0].tx += sent;
 }
-
+uint64_t end_time = 0;
 /* main processing loop */
 static void
 cms_main_loop(uint16_t *penality_list)
@@ -344,7 +344,7 @@ cms_main_loop(uint16_t *penality_list)
 	struct rte_mbuf         *m;
 	int                      sent;
 	unsigned                 lcore_id;
-	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc, end_time;
+	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc,end_warmup;
 	unsigned                 i, j, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
@@ -423,7 +423,7 @@ cms_main_loop(uint16_t *penality_list)
 				total++;
 				/*if (penality_list[q] >= 1) {
 				    penality_list[q] --;
-				    skipped++;
+				    empty++;
 				    // printf("Skipping queue %d, penality now %d\n", q, penality_list[q]);
 				    // for (int p = 0; p < cms_rx_queue_per_lcore; p++) {
 				    // 	if(p==q) {
@@ -449,14 +449,18 @@ cms_main_loop(uint16_t *penality_list)
 						rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + prefetch_distance], void *));
 					}
 					count_add(m);
-					// cms_simple_forward(m, portid);
-					rte_pktmbuf_free(m);
+					cms_simple_forward(m, portid);
+					// rte_pktmbuf_free(m);
 				}
 				if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 					q--; // if we got MAX_PKT_BURST packets, we need to process them again
 					max_loops--;
-				} else {
+				}
+				if(nb_rx< MAX_PKT_BURST) {
 					spin_time++;
+				}
+				if(nb_rx==0) {
+					empty++;
 				}
 
 				/*if (nb_rx != MAX_PKT_BURST) {
@@ -483,10 +487,12 @@ cms_main_loop(uint16_t *penality_list)
 			}
 		}
 		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
+			end_time = cur_tsc-end_warmup;
 			break;
 		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
 			// rte_eth_stats_reset(portid); // skip the first 3 seconds
 			after_warmup = true;
+			end_warmup= cur_tsc;
 			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
 		}
 	}
@@ -1178,7 +1184,8 @@ main(int argc, char **argv)
 	printf("RX dropped: %" PRIu64 "\n", stats.imissed);
 	// printf("measured RX: %" PRIu64 "\n", measured_packets_rx);
 	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
-	printf("measured RX Throughput: %.2f\n", (float)measured_packets_rx / measured_tick);
+	printf("measured RX Throughput: %.2f\n", (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
+	printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
 
 	// save countmin in a file
 	FILE *fp;
