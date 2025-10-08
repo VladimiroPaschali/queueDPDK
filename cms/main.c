@@ -147,14 +147,17 @@ static uint64_t timer_period      = 10; /* default period is 10 seconds */
 uint32_t        spin_time         = 0;
 uint32_t        miss              = 0;
 uint32_t        total             = 0;
-uint32_t        empty           = 0;
+uint32_t        empty             = 0;
 bool            aggressive        = false;   /* aggressive mode disabled by default */
 static unsigned prefetch_distance = 4;       /* prefetch distance for mbufs in burst */
 uint32_t        cms_columns       = COLUMNS; /* number of columns in the count-min sketch */
 bool            after_warmup      = false;   /* reset statistics after warmup time */
 /* Print out statistics on packets dropped */
-uint64_t measured_packets_rx = 0;
-uint64_t measured_tick       = 0;
+uint64_t measured_packets_rx  = 0;
+uint64_t measured_packets_rx2 = 0;
+uint64_t measured_packets_rx3 = 0;
+
+uint64_t measured_tick = 0;
 static void
 print_stats(void)
 {
@@ -303,16 +306,16 @@ count_add(struct rte_mbuf *m)
 	} __attribute__((packed));
 
 	struct five_tuple key = {
-		.src_ip   = src_ip,
-		.dst_ip   = dst_ip,
-		.src_port = src_port,
-		.dst_port = dst_port,
-		.proto    = proto,
+	    .src_ip   = src_ip,
+	    .dst_ip   = dst_ip,
+	    .src_port = src_port,
+	    .dst_port = dst_port,
+	    .proto    = proto,
 	};
 
 	// --- calcolo hash sui campi della 5-tuple ---
 	for (int i = 0; i < HASHFN_N; i++) {
-		uint64_t h = xxhash64((const char *)&key, sizeof(key), i);
+		uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
 		uint32_t target_idx = h & (cms_columns - 1);
 		cm->values[i][target_idx]++;
 	}
@@ -338,13 +341,13 @@ cms_simple_forward(struct rte_mbuf *m, unsigned portid)
 uint64_t end_time = 0;
 /* main processing loop */
 static void
-cms_main_loop(uint16_t *penality_list)
+cms_main_loop(void)
 {
 	struct rte_mbuf         *pkts_burst[MAX_PKT_BURST];
 	struct rte_mbuf         *m;
 	int                      sent;
 	unsigned                 lcore_id;
-	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc,end_warmup;
+	uint64_t                 prev_tsc, diff_tsc, cur_tsc, timer_tsc, end_warmup;
 	unsigned                 i, j, portid, nb_rx;
 	struct lcore_queue_conf *qconf;
 	const uint64_t drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
@@ -418,24 +421,8 @@ cms_main_loop(uint16_t *penality_list)
 		int max_loops = 100000;
 		for (i = 0; i < qconf->n_rx_port; i++) {
 			portid = qconf->rx_port_list[i];
-			// for (int q = 1923; q < 1924; q++) {
 			for (int q = 0; q < cms_rx_queue_per_lcore; q++) {
 				total++;
-				/*if (penality_list[q] >= 1) {
-				    penality_list[q] --;
-				    empty++;
-				    // printf("Skipping queue %d, penality now %d\n", q, penality_list[q]);
-				    // for (int p = 0; p < cms_rx_queue_per_lcore; p++) {
-				    // 	if(p==q) {
-				    // 		printf("[%4u]", penality_list[p]);
-				    // 	}
-				    // 	else {
-				    // 		printf(" %4u ", penality_list[p]);
-				    // 	}
-				    // }
-				    // printf("\n");
-				    continue;
-				}*/
 				nb_rx = rte_eth_rx_burst(portid, q, pkts_burst, MAX_PKT_BURST);
 
 				port_statistics[portid][q].rx += nb_rx;
@@ -451,48 +438,34 @@ cms_main_loop(uint16_t *penality_list)
 					count_add(m);
 					cms_simple_forward(m, portid);
 					// rte_pktmbuf_free(m);
+					if (after_warmup) {
+						measured_packets_rx2++;
+					}
 				}
 				if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 					q--; // if we got MAX_PKT_BURST packets, we need to process them again
 					max_loops--;
 				}
-				if(nb_rx< MAX_PKT_BURST) {
+				if (nb_rx < MAX_PKT_BURST) {
 					spin_time++;
 				}
-				if(nb_rx==0) {
+				if (nb_rx == 0) {
 					empty++;
 				}
-
-				/*if (nb_rx != MAX_PKT_BURST) {
-				    penality_list[q] += MAX_PKT_BURST - nb_rx; // if we got less than MAX_PKT_BURST
-				packets, we can skip some iterations
-				    // penality_list[q] += 1; // if we got less than MAX_PKT_BURST packets, we can
-				skip some iterations miss++;
-
-
-				    // print penality list
-				    // for (int p = 0; p < cms_rx_queue_per_lcore; p++) {
-				    // 	if(p==q) {
-				    // 		printf("[%4u]", penality_list[p]);
-				    // 	}
-				    // 	else {
-				    // 		printf(" %4u ", penality_list[p]);
-				    // 	}
-				    // }
-				    // printf("\n");
-
-				}*/
-
-				// printf("queue %d penality %d\n", q, penality_list[q]);
+				//fare così mi riduce le prestazioni di 1mpps
+				// if (after_warmup) {
+				// 	measured_packets_rx3 += nb_rx;
+				// }
 			}
 		}
 		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
-			end_time = cur_tsc-end_warmup;
+			end_time = cur_tsc - end_warmup;
 			break;
 		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
 			// rte_eth_stats_reset(portid); // skip the first 3 seconds
+			printf("Warmup finished\n");
 			after_warmup = true;
-			end_warmup= cur_tsc;
+			end_warmup   = cur_tsc;
 			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
 		}
 	}
@@ -501,12 +474,7 @@ cms_main_loop(uint16_t *penality_list)
 static int
 cms_launch_one_lcore(void *arg)
 {
-	uint16_t *penality_list = (uint16_t *)arg;
-	// for (int p = 0; p < cms_rx_queue_per_lcore; p++) {
-	// 	printf(" %4u ", penality_list[p]);
-	// }
-	printf("\n");
-	cms_main_loop(penality_list);
+	cms_main_loop();
 	return 0;
 }
 
@@ -1168,10 +1136,8 @@ main(int argc, char **argv)
 	check_all_ports_link_status(cms_enabled_port_mask);
 
 	ret = 0;
-	uint16_t penality_list[cms_rx_queue_per_lcore];
-	memset(penality_list, 0, sizeof(penality_list));
 	/* launch per-lcore init on every lcore */
-	rte_eal_mp_remote_launch(cms_launch_one_lcore, penality_list, CALL_MAIN);
+	rte_eal_mp_remote_launch(cms_launch_one_lcore, NULL, CALL_MAIN);
 	RTE_LCORE_FOREACH_WORKER(lcore_id)
 	{
 		if (rte_eal_wait_lcore(lcore_id) < 0) {
@@ -1183,10 +1149,11 @@ main(int argc, char **argv)
 	printf("TX packets: %" PRIu64 "\n", stats.opackets);
 	printf("RX dropped: %" PRIu64 "\n", stats.imissed);
 	// printf("measured RX: %" PRIu64 "\n", measured_packets_rx);
-	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
-	printf("measured RX Throughput: %.2f\n", (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
+	printf("measured RX packets: %.2f\n", (float)measured_packets_rx2);
+	printf("measured RX Throughput: %.2f\n",
+	       (double)measured_packets_rx2 / ((double)end_time / (double)rte_get_timer_hz()));
 	printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
-
+	printf("measured RX2 packets: %.2f\n", (float)measured_packets_rx2);
 	// save countmin in a file
 	FILE *fp;
 	fp = fopen("countmin.txt", "w");
