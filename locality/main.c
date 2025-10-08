@@ -358,7 +358,7 @@ cms_main_loop(uint16_t *penality_list)
 
 					/* do this only on main core */
 					if (lcore_id == rte_get_main_lcore()) {
-						print_stats();
+						// print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
 					}
@@ -424,33 +424,34 @@ cms_main_loop(uint16_t *penality_list)
 						continue;
 					}
 
-					if (first_packet) {
-						// primo pacchetto del burst → inizializza
-						prev_src_ip     = src_ip;
-						prev_dst_ip     = dst_ip;
-						prev_src_port   = src_port;
-						prev_dst_port   = dst_port;
-						prev_proto      = proto;
-						locality_factor = 1;
-						first_packet    = false;
-					} else if (src_ip == prev_src_ip && dst_ip == prev_dst_ip &&
-					           src_port == prev_src_port && dst_port == prev_dst_port &&
-					           proto == prev_proto) {
-						locality_factor++;
-						if (locality_factor > max_locality_factor)
-							max_locality_factor = locality_factor;
-					} else {
-						total_locality += locality_factor;
-						flow_blocks++;
-						locality_factor = 1;
+					// if (first_packet) {
+					// 	// primo pacchetto del burst → inizializza
+					// 	prev_src_ip     = src_ip;
+					// 	prev_dst_ip     = dst_ip;
+					// 	prev_src_port   = src_port;
+					// 	prev_dst_port   = dst_port;
+					// 	prev_proto      = proto;
+					// 	locality_factor = 1;
+					// 	first_packet    = false;
+					// } else if (src_ip == prev_src_ip && dst_ip == prev_dst_ip &&
+					//            src_port == prev_src_port && dst_port == prev_dst_port &&
+					//            proto == prev_proto) {
+					// 	locality_factor++;
+					// 	if (locality_factor > max_locality_factor)
+					// 		max_locality_factor = locality_factor;
+					// } else {
+					// 	total_locality += locality_factor;
+					// 	flow_blocks++;
+					// 	locality_factor = 1;
 
-						prev_src_ip   = src_ip;
-						prev_dst_ip   = dst_ip;
-						prev_src_port = src_port;
-						prev_dst_port = dst_port;
-						prev_proto    = proto;
-					}
-
+					// 	prev_src_ip   = src_ip;
+					// 	prev_dst_ip   = dst_ip;
+					// 	prev_src_port = src_port;
+					// 	prev_dst_port = dst_port;
+					// 	prev_proto    = proto;
+					// }
+					printf("%d,%u,%u,%u,%u,%u\n",
+					   q, src_ip, dst_ip, src_port, dst_port, proto);
 					rte_pktmbuf_free(m);
 				}
 				// chiudi l’ultimo blocco del burst
@@ -474,11 +475,12 @@ cms_main_loop(uint16_t *penality_list)
 					global_max_locality = max_locality_factor;
 
 				// --- Stampa ---
-				printf("Queue %d - Burst locality: avg = %.2f, max = %lu, packets = %d\n",
-				       q,
-				       avg_locality_burst,
-				       max_locality_factor,
-				       nb_rx);
+				// printf("Queue %d - Burst locality: avg = %.2f, max = %lu, packets = %d\n",
+				//        q,
+				//        avg_locality_burst,
+				//        max_locality_factor,
+				//        nb_rx);
+				
 			}
 		}
 		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
