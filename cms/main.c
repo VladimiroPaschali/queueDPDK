@@ -436,8 +436,8 @@ cms_main_loop(void)
 						rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + prefetch_distance], void *));
 					}
 					count_add(m);
-					cms_simple_forward(m, portid);
-					// rte_pktmbuf_free(m);
+					// cms_simple_forward(m, portid);
+					rte_pktmbuf_free(m);
 					if (after_warmup) {
 						measured_packets_rx2++;
 					}
