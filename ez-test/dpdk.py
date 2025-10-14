@@ -24,20 +24,24 @@ def _clear_file(log_path: str) -> int:
         pass
     return 0
 
-def _init_csv(csv_path: str, cfg_perf: list, cfg_out_of_order: bool) -> int:
+# def _init_csv(csv_path: str, cfg_perf: list, cfg_out_of_order: bool) -> int:
+def _init_csv(csv_path: str, suite_cfg:json) -> int:
+
     fields = []
-    if cfg_perf:
+    if suite_cfg.get("perf"):
         fields.append("program")
+        if suite_cfg.get("llc-ways"):
+            fields.append("llc_way")
         fields.append("queues")
         fields.append("descriptors")
         fields.append("cms")
         fields.append("prefetch")
         fields.append("aggressive")
         fields.append("throughput")
-        fields.extend(cfg_perf)
+        fields.extend(suite_cfg.get("perf", []))
         fields.append("max_bw")
         fields.append("avg_bw")
-    elif cfg_out_of_order:
+    elif suite_cfg.get("out_of_order"):
         fields.append("program")
         fields.append("queues")
         fields.append("descriptors")
@@ -133,6 +137,15 @@ def _get_bw(cfg_cpu, cfg_time, result_bw) -> int:
 
     result_bw["max_bw"] = max_bw
     result_bw["avg_bw"] = avg_bw
+    return 0
+
+def _change_llc_way(llc_way: int) -> int:
+    command = f"sudo wrmsr -a 0xc8b 0x{llc_way}"
+    try:
+        result = sp.run(shlex.split(command), capture_output=True, text=True, check=True)
+    except sp.CalledProcessError as e:
+        print("Error changing LLC way:", e)
+        return -1
     return 0
 
 def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cfg_ifpci, cfg_app_args, cfg_queues, cfg_prefetch, cfg_aggressive, cfg_descriptors, cfg_cms, cfg_per_pkt) -> int:
@@ -250,8 +263,10 @@ def run_suite(suite_cfg:json, name:str) -> int:
     cfg_aggressive = suite_cfg.get("aggressive", [False])
     cfg_prefetch = suite_cfg.get("prefetch", [0])
     cfg_out_of_order = suite_cfg.get("out-of-order", False)
+    cfg_llc_way = suite_cfg.get("llc-ways", [None])
     #clear csv and sets up fiels
-    _init_csv(csvpath, cfg_perf, cfg_out_of_order)
+    # _init_csv(csvpath, cfg_perf, cfg_out_of_order)
+    _init_csv(csvpath,suite_cfg)
     print(f"CSV file initialized at {csvpath}")
 
     #clear logfile
@@ -266,58 +281,64 @@ def run_suite(suite_cfg:json, name:str) -> int:
     cfg_app_args = cfg_programs[0]["app-args"]
 
 
-    tot_iterations = cfg_repetitions * len(cfg_queues) * len(cfg_descriptors) * len(cfg_cms if cfg_cms else [None]) * len(cfg_prefetch) * len(cfg_aggressive)
+    tot_iterations = cfg_repetitions * len(cfg_queues) * len(cfg_descriptors) * len(cfg_cms if cfg_cms else [None]) * len(cfg_prefetch) * len(cfg_aggressive) * (len(cfg_llc_way))
     tot_time = cfg_time * tot_iterations
 
     print(f"Total estimated time for the experiment: {tot_time} seconds (~{tot_time/60:.2f} minutes)")
 
     # Barra di progresso con tqdm
     with tqdm(total=tot_iterations, desc="Running experiments", unit="run") as pbar:
-        for queue in cfg_queues:
-            for descriptor in cfg_descriptors:
-                for cms in cfg_cms if cfg_cms else [None]:
-                    for prefetch in cfg_prefetch:
-                        for aggressive in cfg_aggressive:
+        for llc_way in cfg_llc_way:
+            if llc_way:
+                print(f"Setting LLC way to {llc_way}")
+                _change_llc_way(llc_way)
+            for queue in cfg_queues:
+                for descriptor in cfg_descriptors:
+                    for cms in cfg_cms if cfg_cms else [None]:
+                        for prefetch in cfg_prefetch:
+                            for aggressive in cfg_aggressive:
 
-                            csvdata.append(cfg_programs[0]["name"])
-                            csvdata.append(queue)
-                            csvdata.append(descriptor)
-                            if cfg_perf:
-                                csvdata.append(cms)
-                            csvdata.append(prefetch)
-                            csvdata.append(aggressive)
+                                csvdata.append(cfg_programs[0]["name"])
+                                if llc_way:
+                                    csvdata.append(llc_way)
+                                csvdata.append(queue)
+                                csvdata.append(descriptor)
+                                if cfg_perf:
+                                    csvdata.append(cms)
+                                csvdata.append(prefetch)
+                                csvdata.append(aggressive)
 
-                            print(f"Running program: {cfg_programs[0]['name']} with queues={queue}, descriptors={descriptor}, cms columns={cms}, prefetch={prefetch}, aggressive={aggressive}")
+                                print(f"Running program: {cfg_programs[0]['name']} with queues={queue}, descriptors={descriptor}, cms columns={cms}, prefetch={prefetch}, aggressive={aggressive}")
 
-                            start_time = time.time()
-                            if cfg_perf:
-                                perf_data, throughput = _load_with_perf(
-                                    cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
-                                    cfg_dpdk_args, cfg_ifpci, cfg_app_args,
-                                    queue, prefetch, aggressive, descriptor, cms, cfg_per_pkt
-                                )
-                                csvdata.append(throughput)
+                                start_time = time.time()
+                                if cfg_perf:
+                                    perf_data, throughput = _load_with_perf(
+                                        cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
+                                        cfg_dpdk_args, cfg_ifpci, cfg_app_args,
+                                        queue, prefetch, aggressive, descriptor, cms, cfg_per_pkt
+                                    )
+                                    csvdata.append(throughput)
 
 
-                            if cfg_out_of_order:
-                                throughput, tot, in_order ,out_of_order = _out_of_order(
-                                    cfg_program_path, cfg_dpdk_args, cfg_ifpci,
-                                    cfg_app_args, queue, prefetch, aggressive, descriptor
-                                )
-                                csvdata.append(throughput)
-                                csvdata.append(tot)
-                                csvdata.append(in_order)
-                                csvdata.append(out_of_order)
-                                csvdata.append(out_of_order / tot if tot > 0 else 0)
+                                if cfg_out_of_order:
+                                    throughput, tot, in_order ,out_of_order = _out_of_order(
+                                        cfg_program_path, cfg_dpdk_args, cfg_ifpci,
+                                        cfg_app_args, queue, prefetch, aggressive, descriptor
+                                    )
+                                    csvdata.append(throughput)
+                                    csvdata.append(tot)
+                                    csvdata.append(in_order)
+                                    csvdata.append(out_of_order)
+                                    csvdata.append(out_of_order / tot if tot > 0 else 0)
 
-                            if cfg_perf:
-                                csvdata.extend(perf_data.values())
-                            _append_to_csv(csvpath, csvdata)
-                            csvdata.clear()
+                                if cfg_perf:
+                                    csvdata.extend(perf_data.values())
+                                _append_to_csv(csvpath, csvdata)
+                                csvdata.clear()
 
-                            pbar.update(1)
-                            elapsed = time.time() - start_time
-                            pbar.set_postfix({"Last run (s)": f"{elapsed:.1f}"})
+                                pbar.update(1)
+                                elapsed = time.time() - start_time
+                                pbar.set_postfix({"Last run (s)": f"{elapsed:.1f}"})
 
 
     return 0

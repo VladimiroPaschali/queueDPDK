@@ -432,11 +432,11 @@ cms_main_loop(void)
 					// printf("lcore %u: port %u, queue %d, packet %d\n", lcore_id, portid, q, j);
 					m = pkts_burst[j];
 					// rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-					if (j + prefetch_distance < nb_rx) {
+					if  ((prefetch_distance>0) && (j + prefetch_distance < nb_rx)) {
 						rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + prefetch_distance], void *));
 					}
 					count_add(m);
-					// cms_simple_forward(m, portid);
+					//cms_simple_forward(m, portid);
 					rte_pktmbuf_free(m);
 					if (after_warmup) {
 						measured_packets_rx2++;
@@ -1153,7 +1153,6 @@ main(int argc, char **argv)
 	printf("measured RX Throughput: %.2f\n",
 	       (double)measured_packets_rx2 / ((double)end_time / (double)rte_get_timer_hz()));
 	printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
-	printf("measured RX2 packets: %.2f\n", (float)measured_packets_rx2);
 	// save countmin in a file
 	FILE *fp;
 	fp = fopen("countmin.txt", "w");
