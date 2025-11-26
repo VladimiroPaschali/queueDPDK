@@ -5,6 +5,7 @@ import subprocess as sp
 import re
 import shlex
 from dpdk import run_suite as dpdk
+from dpdk_rfc import run_suite as dpdk_rfc
 from hooks import before_start, after_finish
 from colors import *
 
@@ -93,6 +94,10 @@ def run(name):
         case "dpdk":
             print(f"{OKCYAN} ---- Starting DPDK suite ----{RESET}")
             print(dpdk(suite_cfg, name))
+        case "dpdk-rfc":
+            print(f"{OKCYAN} ---- Starting DPDK-RFC suite ----{RESET}")
+            print(dpdk_rfc(suite_cfg, name))
+
 
     after_finish(suite_cfg)
     return 0

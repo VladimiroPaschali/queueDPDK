@@ -4,6 +4,7 @@
 
 #include "rte_pmd_qdma.h"
 #include "xxhash64.h"
+#include <arpa/inet.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +57,7 @@
 #define MAX_JUMBO_PKT_LEN 9600
 
 #define MEMPOOL_CACHE_SIZE 256
-#define HASHFN_N 4
+#define HASHFN_N 16
 #define COLUMNS 1048576
 struct countmin {
 	uint64_t **values;
@@ -1489,6 +1490,39 @@ print_stats(void)
 
 	fflush(stdout);
 }
+static inline uint32_t str_to_u32(const char s[4]) {
+    uint32_t v;
+    memcpy(&v, s, 4);  // copia esatti 4 byte
+    return v;
+}
+static int
+check_packet_magic(struct rte_mbuf *m, uint32_t expected_magic) {
+	struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
+	
+	if( ip->src_addr != inet_addr("192.168.0.1") || ip->dst_addr != inet_addr("192.168.1.1") || ip->next_proto_id != IPPROTO_UDP) {
+		return -1; // Not the expected IPs
+	}
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ip + 1);
+	if (rte_be_to_cpu_16(udp->dst_port) != 1028 || rte_be_to_cpu_16(udp->src_port) != 1234) {
+		return -1; // Not the expected ports
+	}
+	uint8_t *payload = (uint8_t *)(udp + 1);
+
+	size_t offset = sizeof(*eth) + sizeof(*ip) + sizeof(*udp);
+	offset = (offset + sizeof(uint64_t)) & ~(sizeof(uint64_t) - 1);
+
+	uint32_t received_magic;
+	memcpy(&received_magic, (uint8_t *)eth + offset, sizeof(uint32_t));
+	printf("Received magic: 0x%08x, Expected magic: 0x%08x\n", received_magic, expected_magic);
+
+	if (received_magic == expected_magic) {
+		return 0; // Magic value matches
+	} else {
+		return -1; // Magic value does not match
+	}
+}
+
 uint64_t end_time = 0;
 static void
 count_add(struct rte_mbuf *m)
@@ -1543,12 +1577,17 @@ count_add(struct rte_mbuf *m)
 	}
 }
 
-static void
+static int
 count_add_burst(struct rte_mbuf **pkts_burst, int nb_pkts)
 {
 	for (int i = 0; i < nb_pkts; i++) {
 		count_add(pkts_burst[i]);
+		if(check_packet_magic(pkts_burst[i], str_to_u32("STOP"))==0) {
+			printf("received stop quitting\n");
+			return 1;
+		}
 	}
+	return 0;	
 }
 
 /* main processing loop */
@@ -1630,7 +1669,10 @@ main_loop(__rte_unused void *dummy)
 				// qui prefetcha
 				prepare_acl_parameter(pkts_burst, &acl_search, nb_rx);
 
-				count_add_burst(pkts_burst, nb_rx);
+				if (count_add_burst(pkts_burst, nb_rx)) {
+					end_time = cur_tsc - end_warmup;
+					return 0; // received stop signal
+				}
 
 				if (acl_search.num_ipv4) {
 					rte_acl_classify(acl_config.acx_ipv4[socketid],
@@ -1667,7 +1709,8 @@ main_loop(__rte_unused void *dummy)
 		}
 		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
 			end_time = cur_tsc - end_warmup;
-			break;
+			//uncomment below to stop after 13 seconds of measurement
+			// break;
 		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
 			// rte_eth_stats_reset(portid); // skip the first 3 seconds
 			printf("Warmup finished\n");
@@ -2135,6 +2178,92 @@ set_default_dest_mac(void)
 	}
 }
 
+#define PKT_SIZE 64 // Dimensione totale del pacchetto
+struct rte_mbuf* create_udp_packet(struct rte_mempool *mbuf_pool,
+								   struct rte_ether_addr src_mac,
+								   struct rte_ether_addr dst_mac,
+								   uint32_t src_ip,
+								   uint32_t dst_ip,
+								   uint16_t src_port,
+								   uint16_t dst_port,
+								   uint32_t magic_value) {
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+        return NULL;
+    }
+
+    // Alloca spazio per il pacchetto
+    char *pkt_data = rte_pktmbuf_append(mbuf, PKT_SIZE);
+    if (!pkt_data) {
+        rte_pktmbuf_free(mbuf);
+        return NULL;
+    }
+
+	// Puntatori ai vari header
+	struct rte_ether_hdr *eth = (struct rte_ether_hdr *)pkt_data;
+	struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)(eth + 1);
+	struct rte_udp_hdr *udp = (struct rte_udp_hdr *)(ip + 1);
+    uint8_t *payload = (uint8_t *)(udp + 1);
+
+	// --- Ethernet header ---
+	rte_ether_addr_copy(&dst_mac, &eth->d_addr);
+	rte_ether_addr_copy(&src_mac, &eth->s_addr);
+	eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+	// --- IPv4 header ---
+	ip->version_ihl = (4 << 4) | (sizeof(struct rte_ipv4_hdr) / 4);
+    ip->type_of_service = 0;
+	ip->total_length = rte_cpu_to_be_16(PKT_SIZE - sizeof(struct rte_ether_hdr));
+    ip->packet_id = rte_cpu_to_be_16(0);
+    ip->fragment_offset = 0;
+    ip->time_to_live = 64;
+    ip->next_proto_id = IPPROTO_UDP;
+    ip->src_addr = src_ip;
+    ip->dst_addr = dst_ip;
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+    // --- UDP header ---
+    udp->src_port = rte_cpu_to_be_16(src_port);
+    udp->dst_port = rte_cpu_to_be_16(dst_port);
+	udp->dgram_len = rte_cpu_to_be_16(PKT_SIZE - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr));
+    udp->dgram_cksum = 0; // opzionale, calcolo checksum se vuoi
+
+	// --- Payload ---
+	for (int i = 0; i < PKT_SIZE - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr); i++) {
+		payload[i] = (uint8_t)i; // dati dummy
+	}
+
+	size_t offset = sizeof(*eth) + sizeof(*ip) + sizeof(*udp);
+	offset = (offset + sizeof(uint64_t)) & ~(sizeof(uint64_t) - 1);
+	// pktgen legge in little-endian
+	// uint32_t magic = rte_cpu_to_be_32(magic_value);
+	uint32_t magic = magic_value;
+
+	memcpy(pkt_data + offset, &magic, sizeof(uint32_t));
+    
+
+    return mbuf;
+}
+
+struct rte_mbuf* create_latency_packet(struct rte_mempool *mbuf_pool,
+								   uint32_t magic_value){
+	struct rte_ether_addr src_mac = {{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}};
+	struct rte_ether_addr dst_mac = {{0xe0, 0xeb, 0xd3, 0x78, 0x95, 0x8d}};
+
+	uint32_t src_ip = inet_addr("192.168.0.1");
+    uint32_t dst_ip = inet_addr("192.168.1.1");
+    uint16_t src_port = 1234;
+    uint16_t dst_port = 1028;
+
+	struct rte_mbuf *pkt = create_udp_packet(mbuf_pool, src_mac, dst_mac, src_ip, dst_ip, src_port, dst_port, magic_value);
+
+	if (!pkt) {
+				rte_exit(EXIT_FAILURE, "Errore creazione pacchetto\n");
+	}
+	return pkt;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2396,6 +2525,30 @@ main(int argc, char **argv)
 		}
 	}
 	check_all_ports_link_status(enabled_port_mask);
+
+	sleep(3);
+	//rfc
+	RTE_ETH_FOREACH_DEV(portid) {
+		int send_packets = rte_log2_u32(queues) + 1;
+		printf("numero di pacchetti %d\n",send_packets);
+		for(int i=0; i<send_packets; i++){
+			//send error packet 0xf00dcafc
+			uint32_t magic_value = 0xf00dcafc;
+			//creazione pacchetto latency
+			struct rte_mbuf *pkt = create_latency_packet(pktmbuf_pool, magic_value);
+			// --- Invia pacchetto su porta 0, queue 0 ---
+			uint16_t nb_tx = rte_eth_tx_burst(portid, 0, &pkt, 1);
+			if (nb_tx < 1) {
+				printf("Invio fallito, liberando mbuf\n");
+				rte_pktmbuf_free(pkt);
+				rte_exit(EXIT_FAILURE, "Errore Invio pacchetto clear\n");
+
+			} else {
+				printf("Pacchetto inviato con successo\n");
+			}
+		}
+		
+	}
 
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
