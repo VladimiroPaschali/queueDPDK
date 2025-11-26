@@ -193,11 +193,11 @@ def _load(program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args, cfg_queues, cfg_
 
 
 
-def run_suite(suite_cfg:json, name:str) -> int:
+def run_suite(suite_cfg:json, suite_name:str) -> int:
 
-    logpath = os.path.join(os.getcwd(),"suites", name, "log.txt")
-    csvpath = os.path.join(os.getcwd(),"suites", name, "results.csv")
-    allcsvpath = os.path.join(os.getcwd(),"suites", name, "all_results.csv")
+    logpath = os.path.join(os.getcwd(),"suites", suite_name, "log.txt")
+    csvpath = os.path.join(os.getcwd(),"suites", suite_name, "results.csv")
+    allcsvpath = os.path.join(os.getcwd(),"suites", suite_name, "all_results.csv")
     cfg_absolute_path = os.path.abspath(suite_cfg["exp-dir"])
     cfg_ifpci = suite_cfg["ifpci"]
     cfg_time = suite_cfg["time"]
@@ -276,7 +276,7 @@ def run_suite(suite_cfg:json, name:str) -> int:
                                     #         queue, prefetch, aggressive, descriptor, cms, cfg_per_pkt
                                     #     )
                                     _load(cfg_program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args,
-                                            queue, prefetch, aggressive, descriptor, cms, cfg_programs[0]['name'] )
+                                            queue, prefetch, aggressive, descriptor, cms, suite_name )
                                     
                                     _append_to_csv(allcsvpath, allcsvdata)
                                     reps_results.append(metrics)
