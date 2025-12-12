@@ -167,12 +167,19 @@ def _load(program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args, cfg_queues, cfg_
         case name if "marco" in name:
             command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}{cfg_marco}"
             command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch}"
+            # prova sal skip
+            # command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
+            # command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch} -s 1000"
+
         case name if "cms" in name:
             command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
             command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch}"
-        case name if "chain" in name:
+        case name if "chain" or "asni" in name:
             command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
             command += f" -- {cfg_app_args} -q {cfg_queues}"
+            #sal skip
+            # command += f" -- {cfg_app_args} -q {cfg_queues} -s 1000 -v"
+
     #se marco nel nome
     # se chain nel nome
 

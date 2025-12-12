@@ -12,6 +12,8 @@ from hooks import before_exp, after_exp
 import psutil
 from tqdm import tqdm
 import time
+import statistics
+
 
 
 def _append_to_log(log_path: str, data: str) -> int:
@@ -24,40 +26,69 @@ def _clear_file(log_path: str) -> int:
         pass
     return 0
 
-# def _init_csv(csv_path: str, cfg_perf: list, cfg_out_of_order: bool) -> int:
-def _init_csv(csv_path: str, suite_cfg:json) -> int:
+def _init_csv(csv_path: str, suite_cfg: json) -> int:
 
     fields = []
-    if suite_cfg.get("perf"):
+
+    is_all = "all" in csv_path      # CSV di tutte le ripetizioni?
+    has_perf = suite_cfg.get("perf")
+    has_llc = suite_cfg.get("llc-ways")
+    has_ooo = suite_cfg.get("out_of_order")
+
+    # ---- CASO CSV PERF / CSV MEDIE ----
+    if has_perf:
         fields.append("program")
-        if suite_cfg.get("llc-ways"):
+        if is_all:
+            fields.append("repetition")
+        if has_llc:
             fields.append("llc_way")
         fields.append("queues")
         fields.append("descriptors")
         fields.append("cms")
         fields.append("prefetch")
         fields.append("aggressive")
-        fields.append("throughput")
-        fields.extend(suite_cfg.get("perf", []))
-        fields.append("max_bw")
-        fields.append("avg_bw")
-    elif suite_cfg.get("out_of_order"):
+
+        if is_all:
+            # CSV "all" → valori diretti
+            fields.append("throughput")
+            fields.extend(suite_cfg.get("perf", []))
+            fields.append("max_bw")
+            fields.append("avg_bw")
+        else:
+            # CSV finale → media e std alternati
+            metrici = ["throughput"] + suite_cfg.get("perf", []) + ["max_bw", "avg_bw"]
+
+            for m in metrici:
+                fields.append(f"{m}_mean")
+                fields.append(f"{m}_std")
+
+    # ---- CASO OUT-OF-ORDER / CSV MEDIE E STD ----
+    elif has_ooo:
         fields.append("program")
         fields.append("queues")
         fields.append("descriptors")
         fields.append("prefetch")
         fields.append("aggressive")
-        fields.append("throughput")
-        fields.append("total")
-        fields.append("in order")
-        fields.append("out of order")
-        fields.append("percentage out of order")
 
-    # Create the CSV file and write the header
-    with open(csv_path, "w",newline='') as csvfile:
+        if is_all:
+            # CSV "all"
+            fields.append("throughput")
+            fields.append("total")
+            fields.append("in_order")
+            fields.append("out_of_order")
+            fields.append("percentage_out_of_order")
+        else:
+            # CSV finale (media + std alternati)
+            metrici = ["throughput", "total", "in_order", "out_of_order", "percentage_out_of_order"]
+            for m in metrici:
+                fields.append(f"{m}_mean")
+                fields.append(f"{m}_std")
+
+    # ---- Scrittura header ----
+    with open(csv_path, "w", newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(fields)
-
+    return 0
 
 def _append_to_csv(csv_path: str, data: list) -> int:
     with open(csv_path, "a") as csvfile:
@@ -148,7 +179,7 @@ def _change_llc_way(llc_way: int) -> int:
         return -1
     return 0
 
-def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cfg_ifpci, cfg_app_args, cfg_queues, cfg_prefetch, cfg_aggressive, cfg_descriptors, cfg_cms, cfg_per_pkt) -> int:
+def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cfg_ifpci, cfg_app_args, cfg_queues, cfg_prefetch, cfg_aggressive, cfg_descriptors, cfg_cms, cfg_per_pkt, prog_name) -> int:
 
     #sudo perf stat -C 4 -e cycles,instructions,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses,L1-dcache-stores,
     # l2_request.miss,l2_request.all,dTLB-loads,dTLB-load-misses,LLC-loads,LLC-load-misses,LLC-stores
@@ -159,9 +190,14 @@ def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cf
     perf_events = ",".join(cfg_perf)
     cms = f"-c {cfg_cms}" if cfg_cms else ""
 
-    command = f"sudo perf stat -C {cfg_cpu} -e {perf_events} --timeout {perf_timeout} {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
-    command += f" -- {cfg_app_args} -q {cfg_queues} -d {cfg_descriptors} {aggressive} {cms} -p {cfg_prefetch}"
-    # print(command)
+    match prog_name:
+        case name if "asni" in name:
+            command = f"sudo perf stat -C {cfg_cpu} -e {perf_events} --timeout {perf_timeout} {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
+            command += f" -- {cfg_app_args} -q {cfg_queues}"
+        case _:
+            command = f"sudo perf stat -C {cfg_cpu} -e {perf_events} --timeout {perf_timeout} {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
+            command += f" -- {cfg_app_args} -q {cfg_queues} -d {cfg_descriptors} {aggressive} {cms} -p {cfg_prefetch}"
+    print(command)
 
     #lancia un thread diverso per calcolare la banda
     result_bw = {"max_bw": 0, "avg_bw": 0}
@@ -267,6 +303,8 @@ def run_suite(suite_cfg:json, name:str) -> int:
     #clear csv and sets up fiels
     # _init_csv(csvpath, cfg_perf, cfg_out_of_order)
     _init_csv(csvpath,suite_cfg)
+    _init_csv(allcsvpath,suite_cfg)
+
     print(f"CSV file initialized at {csvpath}")
 
     #clear logfile
@@ -286,7 +324,6 @@ def run_suite(suite_cfg:json, name:str) -> int:
 
     print(f"Total estimated time for the experiment: {tot_time} seconds (~{tot_time/60:.2f} minutes)")
 
-    # Barra di progresso con tqdm
     with tqdm(total=tot_iterations, desc="Running experiments", unit="run") as pbar:
         for llc_way in cfg_llc_way:
             if llc_way:
@@ -307,38 +344,82 @@ def run_suite(suite_cfg:json, name:str) -> int:
                                     csvdata.append(cms)
                                 csvdata.append(prefetch)
                                 csvdata.append(aggressive)
+                                runs_all = []   # qui mettiamo solo i valori numerici delle ripetizioni
 
-                                print(f"Running program: {cfg_programs[0]['name']} with queues={queue}, descriptors={descriptor}, cms columns={cms}, prefetch={prefetch}, aggressive={aggressive}")
+                                for rep in range(cfg_repetitions):
+                                    print(f"Repetition {rep+1}/{cfg_repetitions}")
+                                    print(f"Running program: {cfg_programs[0]['name']} with queues={queue}, descriptors={descriptor}, cms columns={cms}, prefetch={prefetch}, aggressive={aggressive}")
 
-                                start_time = time.time()
-                                if cfg_perf:
-                                    perf_data, throughput = _load_with_perf(
-                                        cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
-                                        cfg_dpdk_args, cfg_ifpci, cfg_app_args,
-                                        queue, prefetch, aggressive, descriptor, cms, cfg_per_pkt
-                                    )
-                                    csvdata.append(throughput)
+                                    csvdata_rep = csvdata.copy()
+                                    csvdata_rep.insert(1, rep+1)
+                                    allcsvdata.extend(csvdata_rep)
+
+                                    start_time = time.time()
+
+                                    row_rep = []   # raccolgo dati numerici della singola ripetizione
+
+                                    if cfg_perf:
+                                        perf_data, throughput = _load_with_perf(
+                                            cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
+                                            cfg_dpdk_args, cfg_ifpci, cfg_app_args,
+                                            queue, prefetch, aggressive, descriptor, cms,
+                                            cfg_per_pkt, cfg_programs[0]['name']
+                                        )
+
+                                        allcsvdata.append(throughput)
+                                        row_rep.append(throughput)
+
+                                    if cfg_out_of_order:
+                                        throughput, tot, in_order, out_of_order = _out_of_order(
+                                            cfg_program_path, cfg_dpdk_args, cfg_ifpci,
+                                            cfg_app_args, queue, prefetch, aggressive, descriptor
+                                        )
+
+                                        allcsvdata.extend([
+                                            throughput,
+                                            tot,
+                                            in_order,
+                                            out_of_order,
+                                            out_of_order / tot if tot > 0 else 0
+                                        ])
+
+                                        row_rep.extend([throughput, tot, in_order, out_of_order])
+
+                                    if cfg_perf:
+                                        allcsvdata.extend(perf_data.values())
+                                        row_rep.extend(perf_data.values())
+
+                                    # Salvo tutti i dati della singola ripetizione in allcsv
+                                    _append_to_csv(allcsvpath, allcsvdata)
+                                    allcsvdata.clear()
+
+                                    # aggiungo alla lista globale per media/std
+                                    runs_all.append(row_rep)
+
+                                    pbar.update(1)
+                                    elapsed = time.time() - start_time
+                                    pbar.set_postfix({"Last run (s)": f"{elapsed:.1f}"})
 
 
-                                if cfg_out_of_order:
-                                    throughput, tot, in_order ,out_of_order = _out_of_order(
-                                        cfg_program_path, cfg_dpdk_args, cfg_ifpci,
-                                        cfg_app_args, queue, prefetch, aggressive, descriptor
-                                    )
-                                    csvdata.append(throughput)
-                                    csvdata.append(tot)
-                                    csvdata.append(in_order)
-                                    csvdata.append(out_of_order)
-                                    csvdata.append(out_of_order / tot if tot > 0 else 0)
+                                # ---- DOPO LE RIPETIZIONI ----
 
-                                if cfg_perf:
-                                    csvdata.extend(perf_data.values())
-                                _append_to_csv(csvpath, csvdata)
-                                csvdata.clear()
+                                # Trasponi per colonna
+                                columns = list(zip(*runs_all))
 
-                                pbar.update(1)
-                                elapsed = time.time() - start_time
-                                pbar.set_postfix({"Last run (s)": f"{elapsed:.1f}"})
+                                # Calcola media e std
+                                means = [statistics.mean(col) for col in columns]
+                                stds  = [statistics.stdev(col) if len(col) > 1 else 0 for col in columns]
 
+                                # Alterna media/std → [m1, s1, m2, s2, m3, s3, ...]
+                                mean_std_pairs = []
+                                for m, s in zip(means, stds):
+                                    mean_std_pairs.extend([m, s])
 
+                                # Riga finale per il CSV
+                                csvdata_final = csvdata.copy()
+                                csvdata_final.extend(mean_std_pairs)
+
+                                _append_to_csv(csvpath, csvdata_final)
+
+                                
     return 0
