@@ -63,6 +63,8 @@
 
 #define MEMPOOL_CACHE_SIZE 256
 #define HASHFN_N 16
+// #define HASHFN_N 40
+
 #define COLUMNS 1048576
 // #define COLUMNS 1024
 
@@ -108,6 +110,7 @@ uint32_t        skip       = 0;
 uint32_t        empty      = 0;
 uint32_t        total      = 0;
 uint32_t        spin_time  = 0;
+uint32_t		n_bursts   = 0;
 uint32_t        spin_pkt   = 0;
 
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
@@ -1495,11 +1498,13 @@ print_stats(void)
 	// printf("miss: %u\n", miss);
 	printf("empty/sec (the poll read no packets): %u\n", empty);
 	printf("total (burst in a second): %u (%u)\n", total, spin_pkt / (total + 1));
+	printf("packets/burst: %u\n", n_bursts == 0 ? 0 : spin_pkt / n_bursts);
 	active    = 0;
 	empty     = 0;
 	spin_time = 0;
 	spin_pkt  = 0;
 	total     = 0;
+	n_bursts  = 0;
 	if (aggressive)
 		printf("With aggressive policy\n");
 	else
@@ -1564,7 +1569,7 @@ check_packet_magic(struct rte_mbuf *m, uint32_t expected_magic)
 
 	uint32_t received_magic;
 	memcpy(&received_magic, (uint8_t *)eth + offset, sizeof(uint32_t));
-	printf("Received magic: 0x%08x, Expected magic: 0x%08x\n", received_magic, expected_magic);
+	// printf("Received magic: 0x%08x, Expected magic: 0x%08x\n", received_magic, expected_magic);
 
 	if (received_magic == expected_magic) {
 		return 0; // Magic value matches
@@ -1619,27 +1624,27 @@ count_add(struct rte_mbuf *m)
 	};
 
 	// --- calcolo hash sui campi della 5-tuple ---
-	// for (int i = 0; i < HASHFN_N; i++) {
-	// 	uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
-	// 	uint32_t target_idx = h & (COLUMNS - 1);
-	// 	cm->values[i][target_idx]++;
-	// }
-
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < HASHFN_N; i++) {
 		uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
 		uint32_t target_idx = h & (COLUMNS - 1);
 		cm->values[i][target_idx]++;
 	}
-	for (int i = 0; i < 4; i++) {
-		uint64_t h          = xxhash64((const char *)&(key.dst_ip), sizeof(key.dst_ip), i);
-		uint32_t target_idx = h & (COLUMNS - 1);
-		cm->values[i+4][target_idx]++;
-	}
-	for (int i = 0; i < 4; i++) {
-		uint64_t h          = xxhash64((const char *)&key.src_ip, sizeof(key.src_ip), i);
-		uint32_t target_idx = h & (COLUMNS - 1);
-		cm->values[i+8][target_idx]++;
-	}
+
+	// for (int i = 0; i < 4; i++) {
+	// 	uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
+	// 	uint32_t target_idx = h & (COLUMNS - 1);
+	// 	cm->values[i][target_idx]++;
+	// }
+	// for (int i = 0; i < 4; i++) {
+	// 	uint64_t h          = xxhash64((const char *)&(key.dst_ip), sizeof(key.dst_ip), i);
+	// 	uint32_t target_idx = h & (COLUMNS - 1);
+	// 	cm->values[i+4][target_idx]++;
+	// }
+	// for (int i = 0; i < 4; i++) {
+	// 	uint64_t h          = xxhash64((const char *)&key.src_ip, sizeof(key.src_ip), i);
+	// 	uint32_t target_idx = h & (COLUMNS - 1);
+	// 	cm->values[i+8][target_idx]++;
+	// }
 	
 }
 
@@ -1715,7 +1720,7 @@ main_loop(__rte_unused void *dummy)
 	uint64_t warmup_time = 3 * rte_get_timer_hz();
 	uint64_t stop_time   = (10 * rte_get_timer_hz()) + warmup_time;
 
-	while (!force_quit) {
+	while (1) {
 
 		cur_tsc = rte_rdtsc();
 
@@ -1766,6 +1771,7 @@ main_loop(__rte_unused void *dummy)
 			portid = qconf->rx_queue_list[i].port_id;
 			// queueid = qconf->rx_queue_list[i].queue_id;
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
+			n_bursts++;
 
 			if (skip > 0)
 				queue_hit[i] = skip * (nb_rx > 0);
@@ -1828,7 +1834,7 @@ main_loop(__rte_unused void *dummy)
 		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
 			end_time = cur_tsc - end_warmup;
 			// uncomment below to stop after 13 seconds of measurement
-			 break;
+			// break;
 		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
 			// rte_eth_stats_reset(portid); // skip the first 3 seconds
 			printf("Warmup finished\n");
@@ -2427,9 +2433,9 @@ main(int argc, char **argv)
 
 	set_default_dest_mac();
 
-	force_quit = false;
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
+	// force_quit = false;
+	// signal(SIGINT, signal_handler);
+	// signal(SIGTERM, signal_handler);
 
 
 	/* parse application arguments (after the EAL ones) */
