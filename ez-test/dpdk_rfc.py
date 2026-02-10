@@ -35,6 +35,12 @@ def _init_csv(csv_path: str, suite_cfg:json) -> int:
     fields.append("cms")
     fields.append("prefetch")
     fields.append("aggressive")
+    fields.append("throughput")
+    fields.append("empty_poll")
+    fields.append("packet_per_burst")
+    fields.append("not_full")
+
+
 
     # Create the CSV file and write the header
     with open(csv_path, "w",newline='') as csvfile:
@@ -53,6 +59,11 @@ def _init_csv_all(csv_path: str, suite_cfg:json) -> int:
     fields.append("cms")
     fields.append("prefetch")
     fields.append("aggressive")
+    fields.append("throughput")
+    fields.append("empty_poll")
+    fields.append("packet_per_burst")
+    fields.append("not_full")
+
 
     # Create the CSV file and write the header
     with open(csv_path, "w",newline='') as csvfile:
@@ -88,6 +99,56 @@ def _get_dpdk_throughput(dpdk_output) -> int:
         print("RX packets not found.")
     
     return rx_packets
+
+def _get_empty_poll(dpdk_output) -> int:
+    matches = re.findall(
+        r'empty/sec\s*\(the poll read no packets\)\s*:\s*(\d+)',
+        # r'empty/burst.*?:\s*([\d.]+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        empty_poll = float(matches[-1]) 
+        print("Empty poll (ultimo):", empty_poll)
+    else:
+        empty_poll = -1
+        print("Empty poll not found")
+
+    return empty_poll
+
+def _get_packet_per_burst(dpdk_output) -> int:
+    matches = re.findall(
+        # r'packets/burst:\s*(\d+)',
+        r'pkts/burst.*?:\s*([\d.]+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        packet_per_burst = float(matches[-1]) 
+        print("Packets per burst (ultimo):", packet_per_burst)
+    else:
+        packet_per_burst = -1
+        print("Packets per burst not found")    
+    return packet_per_burst
+
+def _get_not_full(dpdk_output) -> int:
+    matches = re.findall(
+        # r'not-full/burst.*?:\s*([\d.]+)',
+        #not full (resets every second):
+        r'not full \(resets every second\):\s*(\d+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        not_full = float(matches[-1]) 
+        print("Not full burst (ultimo):", not_full)
+    else:
+        not_full = -1
+        print("Not full burst not found")    
+    return not_full
 
 def _parse_perf_output(perf_output: str) -> dict:
 
@@ -151,52 +212,71 @@ def _change_llc_way(llc_way: int) -> int:
 
 def _load(program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args, cfg_queues, cfg_prefetch, cfg_aggressive, cfg_descriptors, cfg_cms, cfg_program_name) -> int:
 
-    aggressive = "-a" if cfg_aggressive else ""
+    # aggressive = "-a" if cfg_aggressive else "-s 100"
+    aggressive = cfg_aggressive 
 
     cms = f"-c {cfg_cms}" if cfg_cms else ""
     descriptors = f"-d {cfg_descriptors}" if cfg_descriptors else ""
     prefetch = f"-p {cfg_prefetch}" if cfg_prefetch else ""
 
     cfg_marco = f",indirect_queues={cfg_queues}"
-
+    # cfg_marco = f",indirect_queues=1"
+    
     command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}{cfg_marco}"
     command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch}"
 
     #se cms nel nome
     match cfg_program_name:
         case name if "marco" in name:
-            command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}{cfg_marco}"
-            command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch}"
-            # prova sal skip
-            # command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
-            # command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch} -s 1000"
+            if "chain" in name or "asni" in name:
+                command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}{cfg_marco}"
+                command += f" -- {cfg_app_args} -q {cfg_queues}"
+            else:
+                command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}{cfg_marco}"
+                command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch}"
+                # prova sal skip
+                # command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
+                # command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch} -s 1000"
 
         case name if "cms" in name:
             command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
             command += f" -- {cfg_app_args} -q {cfg_queues} {descriptors} {aggressive} {cms} {prefetch}"
         case name if "chain" or "asni" in name:
             command = f"sudo {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
-            command += f" -- {cfg_app_args} -q {cfg_queues}"
+            # command += f" -- {cfg_app_args} -q {cfg_queues}"
             #sal skip
-            # command += f" -- {cfg_app_args} -q {cfg_queues} -s 1000 -v"
+            command += f" -- {cfg_app_args} -q {cfg_queues} {aggressive}"
 
     #se marco nel nome
     # se chain nel nome
 
-
+    sleep(1)  # give some time before starting the next test
     print(command)
 
     try:
-        result = sp.run(shlex.split(command),capture_output=True,text=True, check=True)
+        result = sp.run(shlex.split(command),capture_output=True,text=True, check=True, timeout=1000)
+        # result = sp.run(shlex.split(command),capture_output=True,text=True, check=True, timeout=5)
+
 
     except sp.CalledProcessError as e:
-        print("Error running load command:", e)
-        return -1
+        throughput, empty_poll, packet_per_burst, not_full = 1, 1, 1, 1
+        print("Errore nel comando (CalledProcessError):", e)
+        return throughput, empty_poll, packet_per_burst, not_full
+
+    except sp.TimeoutExpired as e:
+        throughput, empty_poll, packet_per_burst, not_full = 1, 1, 1, 1
+        print("Timeout del comando:", e)
+        return throughput, empty_poll, packet_per_burst, not_full
 
     # print(result.stderr)
     # print(result.stdout)
 
-    return True
+    throughput = _get_dpdk_throughput(result.stdout)
+    empty_poll = _get_empty_poll(result.stdout)
+    packet_per_burst = _get_packet_per_burst(result.stdout)
+    not_full = _get_not_full(result.stdout)
+
+    return throughput, empty_poll, packet_per_burst, not_full
 
 
 
@@ -218,6 +298,7 @@ def run_suite(suite_cfg:json, suite_name:str) -> int:
     cfg_programs = suite_cfg["progs"]
     cfg_cms = suite_cfg.get("cms", [])
     cfg_aggressive = suite_cfg.get("aggressive", [False])
+    print(f"Aggressive modes: {cfg_aggressive}")
     cfg_prefetch = suite_cfg.get("prefetch", [0])
     cfg_out_of_order = suite_cfg.get("out-of-order", False)
     cfg_llc_way = suite_cfg.get("llc-ways", [None])
@@ -249,14 +330,14 @@ def run_suite(suite_cfg:json, suite_name:str) -> int:
             if llc_way:
                 print(f"Setting LLC way to {llc_way}")
                 _change_llc_way(llc_way)
-            for queue in cfg_queues:
-                for descriptor in cfg_descriptors if cfg_descriptors else [None]:
-                    for cms in cfg_cms if cfg_cms else [None]:
-                        for prefetch in cfg_prefetch if cfg_prefetch else [None]:
-                            for aggressive in cfg_aggressive:
-                                if (not aggressive and prefetch) or (aggressive and not prefetch):
-                                    print(f"Skipping invalid combination: aggressive={aggressive}, prefetch={prefetch}")
-                                    continue
+            for aggressive in cfg_aggressive:
+                for queue in cfg_queues:
+                    for descriptor in cfg_descriptors if cfg_descriptors else [None]:
+                        for cms in cfg_cms if cfg_cms else [None]:
+                            for prefetch in cfg_prefetch if cfg_prefetch else [None]:
+                                # if (not aggressive and prefetch) or (aggressive and not prefetch):
+                                #     print(f"Skipping invalid combination: aggressive={aggressive}, prefetch={prefetch}")
+                                #     continue
 
                                 reps_results = []
 
@@ -282,9 +363,12 @@ def run_suite(suite_cfg:json, suite_name:str) -> int:
                                     #         cfg_dpdk_args, cfg_ifpci, cfg_app_args,
                                     #         queue, prefetch, aggressive, descriptor, cms, cfg_per_pkt
                                     #     )
-                                    _load(cfg_program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args,
+                                    throughput, empty_poll, packet_per_burst, not_full = _load(cfg_program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args,
                                             queue, prefetch, aggressive, descriptor, cms, suite_name )
-                                    
+                                    allcsvdata.append(throughput)
+                                    allcsvdata.append(empty_poll)
+                                    allcsvdata.append(packet_per_burst)
+                                    allcsvdata.append(not_full)
                                     _append_to_csv(allcsvpath, allcsvdata)
                                     reps_results.append(metrics)
                                     allcsvdata.clear()

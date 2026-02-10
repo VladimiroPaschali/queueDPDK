@@ -72,7 +72,7 @@ struct countmin {
 	uint64_t **values;
 };
 
-struct countmin *cm;
+struct countmin     *cm;
 static volatile bool force_quit;
 
 /*
@@ -110,8 +110,9 @@ uint32_t        skip       = 0;
 uint32_t        empty      = 0;
 uint32_t        total      = 0;
 uint32_t        spin_time  = 0;
-uint32_t		n_bursts   = 0;
+uint32_t        n_bursts   = 0;
 uint32_t        spin_pkt   = 0;
+uint32_t        n_pkts     = 0;
 
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
@@ -1497,14 +1498,25 @@ print_stats(void)
 	       spin_pkt / (spin_time + 1));
 	// printf("miss: %u\n", miss);
 	printf("empty/sec (the poll read no packets): %u\n", empty);
-	printf("total (burst in a second): %u (%u)\n", total, spin_pkt / (total + 1));
-	printf("packets/burst: %u\n", n_bursts == 0 ? 0 : spin_pkt / n_bursts);
+	printf("not full (resets every second): %u\n", spin_time);
+
+	// printf("total (burst in a second): %u (%u)\n", total, spin_pkt / (total + 1));
+	// printf("packets/burst: %u\n", n_bursts == 0 ? 0 : spin_pkt / n_bursts);
+	printf("n_bursts (resets every second): %u\n", n_bursts);
+	printf("pkts (resets every second): %u\n", n_pkts);
+	printf("pkts/burst (resets every second): %.2f\n",
+	       n_bursts == 0 ? 0 : (float)n_pkts / n_bursts);
+	printf("empty/burst (resets every second): %.2f\n",
+	       n_bursts == 0 ? 0 : (float)empty / n_bursts);
+	printf("not-full/burst (resets every second): %.2f\n",
+	       n_bursts == 0 ? 0 : (float)spin_time / n_bursts);
 	active    = 0;
 	empty     = 0;
 	spin_time = 0;
 	spin_pkt  = 0;
 	total     = 0;
 	n_bursts  = 0;
+	n_pkts    = 0;
 	if (aggressive)
 		printf("With aggressive policy\n");
 	else
@@ -1645,9 +1657,7 @@ count_add(struct rte_mbuf *m)
 	// 	uint32_t target_idx = h & (COLUMNS - 1);
 	// 	cm->values[i+8][target_idx]++;
 	// }
-	
 }
-
 
 uint64_t end_time = 0;
 static int
@@ -1675,7 +1685,7 @@ nf_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts, uint16_t portid)
 		                                   sizeof(struct rte_ipv4_hdr)))
 		               ->dst_port;
 
-		if (check_packet_magic(pkts_burst[i], str_to_u32("STOP")) == 0) {
+		if (check_packet_magic(pkts_burst[i], str_to_u32("STOP123456789")) == 0) {
 			printf("received stop quitting\n");
 			return 1;
 		}
@@ -1719,52 +1729,54 @@ main_loop(__rte_unused void *dummy)
 	uint64_t start_time  = rte_rdtsc();
 	uint64_t warmup_time = 3 * rte_get_timer_hz();
 	uint64_t stop_time   = (10 * rte_get_timer_hz()) + warmup_time;
+	// uint64_t stop_time   = (2 * rte_get_timer_hz()) + warmup_time;
 
-	while (1) {
+	while (!force_quit) {
 
 		cur_tsc = rte_rdtsc();
 
-		/*
-		 * TX burst queue drain
-		 */
-		diff_tsc = cur_tsc - prev_tsc;
-		if (unlikely(diff_tsc > drain_tsc)) {
-			for (i = 0; i < qconf->n_tx_port; ++i) {
-				portid = qconf->tx_port_id[i];
-				rte_eth_tx_buffer_flush(
-				    portid, qconf->tx_queue_id[portid], qconf->tx_buffer[portid]);
-			}
-			prev_tsc = cur_tsc;
-		}
+		// /*
+		//  * TX burst queue drain
+		//  */
+		// diff_tsc = cur_tsc - prev_tsc;
+		// if (unlikely(diff_tsc > drain_tsc)) {
+		// 	for (i = 0; i < qconf->n_tx_port; ++i) {
+		// 		portid = qconf->tx_port_id[i];
+		// 		rte_eth_tx_buffer_flush(
+		// 		    portid, qconf->tx_queue_id[portid], qconf->tx_buffer[portid]);
+		// 	}
+		// 	prev_tsc = cur_tsc;
+		// }
 
-		/* if timer is enabled */
-		if (timer_period > 0) {
+		// /* if timer is enabled */
+		// if (timer_period > 0) {
 
-			/* advance the timer */
-			timer_tsc += diff_tsc;
+		// 	/* advance the timer */
+		// 	timer_tsc += diff_tsc;
 
-			/* if timer has reached its timeout */
-			if (unlikely(timer_tsc >= timer_period)) {
+		// 	/* if timer has reached its timeout */
+		// 	if (unlikely(timer_tsc >= timer_period)) {
 
-				/* do this only on main core */
-				if (lcore_id == rte_get_main_lcore()) {
-					print_stats();
-					/* reset the timer */
-					timer_tsc = 0;
-				}
-			}
-		}
-		prev_tsc = cur_tsc;
+		// 		/* do this only on main core */
+		// 		if (lcore_id == rte_get_main_lcore()) {
+		// 			print_stats();
+		// 			/* reset the timer */
+		// 			timer_tsc = 0;
+		// 		}
+		// 	}
+		// }
+		// prev_tsc = cur_tsc;
 
 		/*
 		 * Read packet from RX queues
 		 */
-		int max_loops = 100000;
+		int max_loops = 100;
 
 		for (i = 0; i < queues; ++i) {
 
 			if ((skip > 0) && (queue_hit[i] < skip)) {
 				queue_hit[i]++;
+				// printf("queue %d skip %d\n", i, queue_hit[i]);
 				continue;
 			}
 
@@ -1772,9 +1784,17 @@ main_loop(__rte_unused void *dummy)
 			// queueid = qconf->rx_queue_list[i].queue_id;
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
 			n_bursts++;
+			n_pkts += nb_rx;
 
+			// if (skip > 0)
+			// 	queue_hit[i] = skip * (nb_rx > 0);
 			if (skip > 0)
-				queue_hit[i] = skip * (nb_rx > 0);
+				queue_hit[i] = skip * (nb_rx > 16);
+			// if (skip > 0 && nb_rx > 0) {
+			// 	queue_hit[i] = (MAX_PKT_BURST - nb_rx)* skip;
+			// 	// if (queue_hit[i]>0)
+			// 	// 	printf("queue %d , remaining pkts %d\n", i, queue_hit[i]);
+			// }
 
 			if (nb_rx > 0) {
 				// printf("queueid=%hhu\n", queueid);
@@ -1797,8 +1817,8 @@ main_loop(__rte_unused void *dummy)
 					                 DEFAULT_MAX_CATEGORIES);
 
 					// send_packets(acl_search.m_ipv4, acl_search.res_ipv4, acl_search.num_ipv4);
-					send_packets_always(
-					    acl_search.m_ipv4, acl_search.res_ipv4, acl_search.num_ipv4, portid);
+					// send_packets_always(
+					//     acl_search.m_ipv4, acl_search.res_ipv4, acl_search.num_ipv4, portid);
 				}
 
 				if (acl_search.num_ipv6) {
@@ -1809,11 +1829,12 @@ main_loop(__rte_unused void *dummy)
 					                 DEFAULT_MAX_CATEGORIES);
 
 					// send_packets(acl_search.m_ipv6, acl_search.res_ipv6, acl_search.num_ipv6);
-					send_packets_always(
-					    acl_search.m_ipv6, acl_search.res_ipv6, acl_search.num_ipv6, portid);
+					// send_packets_always(
+					//     acl_search.m_ipv6, acl_search.res_ipv6, acl_search.num_ipv6, portid);
 				}
 				// send_packets_always(pkts_burst, NULL, nb_rx, portid);
-
+				uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+				
 				port_statistics[portid][i].rx += nb_rx;
 				if (after_warmup) {
 					measured_packets_rx += nb_rx;
@@ -1822,6 +1843,8 @@ main_loop(__rte_unused void *dummy)
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 				i--; // if we got MAX_PKT_BURST packets, we need to process them again
 				max_loops--;
+			} else {
+				max_loops = 100;
 			}
 			if (nb_rx < MAX_PKT_BURST) {
 				spin_time++;
@@ -1843,6 +1866,7 @@ main_loop(__rte_unused void *dummy)
 			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
 		}
 	}
+	end_time = rte_rdtsc() - end_warmup;
 	return 0;
 }
 
@@ -2433,10 +2457,9 @@ main(int argc, char **argv)
 
 	set_default_dest_mac();
 
-	// force_quit = false;
-	// signal(SIGINT, signal_handler);
-	// signal(SIGTERM, signal_handler);
-
+	force_quit = false;
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
 
 	/* parse application arguments (after the EAL ones) */
 	ret = parse_args(argc, argv);
@@ -2503,9 +2526,20 @@ main(int argc, char **argv)
 			         portid,
 			         strerror(-ret));
 
+		struct rte_eth_dev *dev = &rte_eth_devices[portid];
 		ret = rte_eth_dev_configure(portid, (uint16_t)queues, (uint16_t)1, &local_port_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%d\n", ret, portid);
+
+		// struct qdma_pci_dev *qdma_dev = dev->data->dev_private;
+		uint32_t reg_offst = 0; // timestamp;
+		uint32_t val       = qdma_reg_read_usr(dev, reg_offst);
+		// Timestamp--> QDMA Reg (0x0) Value: 0x0940907F
+		printf("Timestamp--> QDMA Reg (0x%X) Value: 0x%X\n", reg_offst, val);
+		if (val != 0x940907F) {
+			printf("wrong bitstream\n");
+			return 0;
+		}
 
 		struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
 		int                             i, j;
@@ -2711,6 +2745,7 @@ main(int argc, char **argv)
 		if (rte_eal_wait_lcore(lcore_id) < 0)
 			return -1;
 	}
+	print_stats();
 
 	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
 	printf("measured RX Throughput: %.2f\n",

@@ -51,12 +51,14 @@ def _init_csv(csv_path: str, suite_cfg: json) -> int:
         if is_all:
             # CSV "all" → valori diretti
             fields.append("throughput")
+            fields.append("empty_poll")
+            fields.append("packet_per_burst")
             fields.extend(suite_cfg.get("perf", []))
             fields.append("max_bw")
             fields.append("avg_bw")
         else:
             # CSV finale → media e std alternati
-            metrici = ["throughput"] + suite_cfg.get("perf", []) + ["max_bw", "avg_bw"]
+            metrici = ["throughput", "empty_poll", "packet_per_burst"] + suite_cfg.get("perf", []) + ["max_bw", "avg_bw"]
 
             for m in metrici:
                 fields.append(f"{m}_mean")
@@ -79,7 +81,7 @@ def _init_csv(csv_path: str, suite_cfg: json) -> int:
             fields.append("percentage_out_of_order")
         else:
             # CSV finale (media + std alternati)
-            metrici = ["throughput", "total", "in_order", "out_of_order", "percentage_out_of_order"]
+            metrici = ["throughput", "empty_poll", "packet_per_burst", "total", "in_order", "out_of_order", "percentage_out_of_order"]
             for m in metrici:
                 fields.append(f"{m}_mean")
                 fields.append(f"{m}_std")
@@ -118,6 +120,38 @@ def _get_dpdk_throughput(dpdk_output) -> int:
         print("RX packets not found.")
     
     return rx_packets
+
+def _get_empty_poll(dpdk_output) -> int:
+    matches = re.findall(
+        r'empty/sec\s*\(the poll read no packets\)\s*:\s*(\d+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        empty_poll = int(matches[-1]) 
+        print("Empty poll (ultimo):", empty_poll)
+    else:
+        empty_poll = -1
+        print("Empty poll not found")
+
+    return empty_poll
+
+def _get_packet_per_burst(dpdk_output) -> int:
+    matches = re.findall(
+        r'packets/burst:\s*(\d+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        packet_per_burst = int(matches[-1]) 
+        print("Packets per burst (ultimo):", packet_per_burst)
+    else:
+        packet_per_burst = -1
+        print("Packets per burst not found")    
+    return packet_per_burst
+
 
 def _parse_perf_output(perf_output: str) -> dict:
 
@@ -193,7 +227,9 @@ def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cf
     match prog_name:
         case name if "asni" in name:
             command = f"sudo perf stat -C {cfg_cpu} -e {perf_events} --timeout {perf_timeout} {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
-            command += f" -- {cfg_app_args} -q {cfg_queues}"
+            command += f" -- {cfg_app_args} -q {cfg_queues} {aggressive}"
+            # command += f" -- {cfg_app_args} -q {cfg_queues} -s 1000"
+
         case _:
             command = f"sudo perf stat -C {cfg_cpu} -e {perf_events} --timeout {perf_timeout} {program_path} {cfg_dpdk_args} -a {cfg_ifpci}"
             command += f" -- {cfg_app_args} -q {cfg_queues} -d {cfg_descriptors} {aggressive} {cms} -p {cfg_prefetch}"
@@ -223,9 +259,12 @@ def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cf
     # print(perf_data)
     throughput = _get_dpdk_throughput(result.stdout)
     all_pkts = _get_all_pkts(result.stdout)
+    empty_poll = _get_empty_poll(result.stdout)
+    packet_per_burst = _get_packet_per_burst(result.stdout)
     if throughput <= 0:
         print("Error: Throughput is zero or negative")
         throughput = 1
+        all_pkts = 1
 
     if cfg_per_pkt:
         perf_data_per_pkt = {k: v/ all_pkts for k, v in perf_data.items()}
@@ -235,7 +274,7 @@ def _load_with_perf(cfg_cpu, cfg_perf, cfg_time, program_path, cfg_dpdk_args ,cf
     perf_data["avg_bw"] = avg_bw
     # print("Perf data:", perf_data)
 
-    return perf_data, throughput
+    return perf_data, throughput, empty_poll, packet_per_burst
 
 def _out_of_order(program_path, cfg_dpdk_args, cfg_ifpci, cfg_app_args, cfg_queues, cfg_prefetch, cfg_aggressive, cfg_descriptors) -> int:
     aggressive = "-a" if cfg_aggressive else ""
@@ -334,6 +373,8 @@ def run_suite(suite_cfg:json, name:str) -> int:
                     for cms in cfg_cms if cfg_cms else [None]:
                         for prefetch in cfg_prefetch:
                             for aggressive in cfg_aggressive:
+                                csvdata = []
+
 
                                 csvdata.append(cfg_programs[0]["name"])
                                 if llc_way:
@@ -359,7 +400,7 @@ def run_suite(suite_cfg:json, name:str) -> int:
                                     row_rep = []   # raccolgo dati numerici della singola ripetizione
 
                                     if cfg_perf:
-                                        perf_data, throughput = _load_with_perf(
+                                        perf_data, throughput, empty_poll, packet_per_burst = _load_with_perf(
                                             cfg_cpu, cfg_perf, cfg_time, cfg_program_path,
                                             cfg_dpdk_args, cfg_ifpci, cfg_app_args,
                                             queue, prefetch, aggressive, descriptor, cms,
@@ -386,8 +427,8 @@ def run_suite(suite_cfg:json, name:str) -> int:
                                         row_rep.extend([throughput, tot, in_order, out_of_order])
 
                                     if cfg_perf:
-                                        allcsvdata.extend(perf_data.values())
-                                        row_rep.extend(perf_data.values())
+                                        allcsvdata.extend([empty_poll, packet_per_burst] + list(perf_data.values()))
+                                        row_rep.extend([empty_poll, packet_per_burst] + list(perf_data.values()))
 
                                     # Salvo tutti i dati della singola ripetizione in allcsv
                                     _append_to_csv(allcsvpath, allcsvdata)
