@@ -7,3 +7,4 @@
 *.log
 *.all_results.csv
 *.csv
+*asni-mica/*

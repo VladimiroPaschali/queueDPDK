@@ -752,6 +752,9 @@ prepare_acl_parameter(struct rte_mbuf **pkts_in, struct acl_search_t *acl, int n
 	acl->num_ipv6 = 0;
 
 	/* Prefetch first packets */
+	// for (i = 0; i < PREFETCH_OFFSET && i < nb_rx; i++) {
+	// 	rte_prefetch0(pkts_in[i]);
+	// }
 	for (i = 0; i < PREFETCH_OFFSET && i < nb_rx; i++) {
 		rte_prefetch0(rte_pktmbuf_mtod(pkts_in[i], void *));
 	}
@@ -1635,6 +1638,15 @@ count_add(struct rte_mbuf *m)
 	    .proto    = proto,
 	};
 
+	// uint8_t buf[sizeof(key)];
+	// rte_memcpy(buf, &key, sizeof(key));
+
+	// for (int i = 0; i < HASHFN_N; i++) {
+	// 	uint64_t h          = xxhash64((const void *)buf, sizeof(buf), i);
+	// 	uint32_t target_idx = (uint32_t)(h & (COLUMNS - 1));
+	// 	cm->values[i][target_idx]++;
+	// }
+
 	// --- calcolo hash sui campi della 5-tuple ---
 	for (int i = 0; i < HASHFN_N; i++) {
 		uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
@@ -1689,6 +1701,10 @@ nf_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts, uint16_t portid)
 			printf("received stop quitting\n");
 			return 1;
 		}
+		// if (check_packet_magic(pkts_burst[i], 0xf00dcafe) == 0) {
+		// 	printf("received latency packet\n");
+		// 	return 2;
+		// }
 
 		uint16_t dst_device = nf_process(portid,
 		                                 payload,
@@ -1723,6 +1739,15 @@ main_loop(__rte_unused void *dummy)
 	lcore_id                     = rte_lcore_id();
 	qconf                        = &lcore_conf[lcore_id];
 	socketid                     = rte_lcore_to_socket_id(lcore_id);
+	int ret;
+
+	int  latency_mode   = 0;
+	int  latency_period = 4; // ogni 4 code
+	int  latency_count  = 0;
+	bool inject_queue   = false;
+	int  resume_i       = -1;
+	int  latency_queue  = 27; // coda latency con 64 code totali
+	// int latency_queue = queues -1 ; // ultima coda simulata latency
 
 	RTE_LOG(INFO, L3FWD, "entering main loop on lcore %u\n", lcore_id);
 
@@ -1735,37 +1760,25 @@ main_loop(__rte_unused void *dummy)
 
 		cur_tsc = rte_rdtsc();
 
-		// /*
-		//  * TX burst queue drain
-		//  */
-		// diff_tsc = cur_tsc - prev_tsc;
-		// if (unlikely(diff_tsc > drain_tsc)) {
-		// 	for (i = 0; i < qconf->n_tx_port; ++i) {
-		// 		portid = qconf->tx_port_id[i];
-		// 		rte_eth_tx_buffer_flush(
-		// 		    portid, qconf->tx_queue_id[portid], qconf->tx_buffer[portid]);
-		// 	}
-		// 	prev_tsc = cur_tsc;
-		// }
-
-		// /* if timer is enabled */
-		// if (timer_period > 0) {
-
-		// 	/* advance the timer */
-		// 	timer_tsc += diff_tsc;
-
-		// 	/* if timer has reached its timeout */
-		// 	if (unlikely(timer_tsc >= timer_period)) {
-
-		// 		/* do this only on main core */
-		// 		if (lcore_id == rte_get_main_lcore()) {
-		// 			print_stats();
-		// 			/* reset the timer */
-		// 			timer_tsc = 0;
-		// 		}
-		// 	}
-		// }
-		// prev_tsc = cur_tsc;
+		/*
+		 * TX burst queue drain
+		 */
+		diff_tsc = cur_tsc - prev_tsc;
+		/* if timer is enabled */
+		if (timer_period > 0) {
+			/* advance the timer */
+			timer_tsc += diff_tsc;
+			/* if timer has reached its timeout */
+			if (unlikely(timer_tsc >= timer_period)) {
+				/* do this only on main core */
+				if (lcore_id == rte_get_main_lcore()) {
+					print_stats();
+					/* reset the timer */
+					timer_tsc = 0;
+				}
+			}
+		}
+		prev_tsc = cur_tsc;
 
 		/*
 		 * Read packet from RX queues
@@ -1780,21 +1793,20 @@ main_loop(__rte_unused void *dummy)
 				continue;
 			}
 
+			if (latency_mode && inject_queue) {
+				resume_i     = i;             // salva dove dovevi andare
+				i            = latency_queue; // inietta la coda specificata
+				inject_queue = false;
+			}
+			// printf("queue %d\n", i);
+			// printf("queue %d skip %d\n", i, queue_hit[i]);
+
 			portid = qconf->rx_queue_list[i].port_id;
 			// queueid = qconf->rx_queue_list[i].queue_id;
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
 			n_bursts++;
 			n_pkts += nb_rx;
 
-			// if (skip > 0)
-			// 	queue_hit[i] = skip * (nb_rx > 0);
-			if (skip > 0)
-				queue_hit[i] = skip * (nb_rx > 16);
-			// if (skip > 0 && nb_rx > 0) {
-			// 	queue_hit[i] = (MAX_PKT_BURST - nb_rx)* skip;
-			// 	// if (queue_hit[i]>0)
-			// 	// 	printf("queue %d , remaining pkts %d\n", i, queue_hit[i]);
-			// }
 
 			if (nb_rx > 0) {
 				// printf("queueid=%hhu\n", queueid);
@@ -1803,11 +1815,15 @@ main_loop(__rte_unused void *dummy)
 				// // qui prefetcha
 				prepare_acl_parameter(pkts_burst, &acl_search, nb_rx);
 
-				if (nf_process_burst(pkts_burst, nb_rx, portid)) {
+				ret = nf_process_burst(pkts_burst, nb_rx, portid);
+				if (ret == 1) {
 					printf("stopping\n");
 					end_time = cur_tsc - end_warmup;
 					return 0; // received stop signal
 				}
+				// else if (ret == 2) {
+				// 	printf("latency packet received on queue %d\n", i);
+				// }
 
 				if (acl_search.num_ipv4) {
 					rte_acl_classify(acl_config.acx_ipv4[socketid],
@@ -1834,18 +1850,43 @@ main_loop(__rte_unused void *dummy)
 				}
 				// send_packets_always(pkts_burst, NULL, nb_rx, portid);
 				uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
-				
+
 				port_statistics[portid][i].rx += nb_rx;
 				if (after_warmup) {
 					measured_packets_rx += nb_rx;
 				}
 			}
+			if (latency_mode) {
+
+				/* se abbiamo appena fatto una 27 iniettata */
+				if (resume_i != -1 && i == latency_queue) {
+					i        = resume_i - 1; // -1 per compensare i++
+					resume_i = -1;
+				}
+
+				/* conta SOLO le code normali, ESCLUDI la 27 */
+				else if (i != latency_queue) {
+					latency_count++;
+					if (latency_count == latency_period) {
+						latency_count = 0;
+						inject_queue  = true;
+					}
+				}
+			}
+
+			if (skip > 0 && max_loops == 100)
+				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST/2);
+
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
-				i--; // if we got MAX_PKT_BURST packets, we need to process them again
+				if (i > 0) {
+					i--;
+				}
 				max_loops--;
 			} else {
 				max_loops = 100;
 			}
+			
+
 			if (nb_rx < MAX_PKT_BURST) {
 				spin_time++;
 			}
@@ -2125,6 +2166,7 @@ parse_args(int argc, char **argv)
 	                                 {NULL, 0, 0, 0}};
 
 	static const char short_options[] = "q:" /* queues  */
+										"d:" /* descriptors  */
 	                                    "a"  /* agressive */
 	                                    "v"  /* verbose */
 	                                    "s:" /* skip  */
@@ -2136,6 +2178,15 @@ parse_args(int argc, char **argv)
 	while ((opt = getopt_long(argc, argvopt, short_options, lgopts, &option_index)) != EOF) {
 
 		switch (opt) {
+		case 'd':
+			nb_rxd = parse_queues(optarg);
+			//non è potenza del 2
+			if (nb_rxd < 64 || (nb_rxd & (nb_rxd - 1)) != 0) {
+				printf("invalid number of descriptors\n");
+				return -1;
+			}
+			printf("Number of descriptors per port: %u\n", nb_rxd);
+			break;
 		case 'q':
 			queues = parse_queues(optarg);
 			if (queues == 0) {
@@ -2494,9 +2545,33 @@ main(int argc, char **argv)
 
 	/* create the mbuf pool */
 	pktmbuf_pool = rte_pktmbuf_pool_create(
-	    "mbuf_pool", nb_mbufs, MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+	    "mbuf_pool", nb_mbufs, MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+	    rte_socket_id());
+	// pktmbuf_pool = rte_mempool_create_empty("mbuf_pool",
+	//                                         nb_mbufs,
+	//                                         RTE_MBUF_DEFAULT_BUF_SIZE + sizeof(struct rte_mbuf),
+	//                                         MEMPOOL_CACHE_SIZE,
+	//                                         sizeof(struct rte_pktmbuf_pool_private),
+	//                                         SOCKET_ID_ANY,
+	//                                         rte_socket_id());
 	if (pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+
+	// if (rte_mempool_set_ops_byname(pktmbuf_pool, "stack", NULL) < 0)
+	// 	rte_panic("mempool_set_ops stack failed\n");
+
+	// struct rte_pktmbuf_pool_private *priv = rte_mempool_get_priv(pktmbuf_pool);
+
+	// priv->mbuf_data_room_size = RTE_MBUF_DEFAULT_BUF_SIZE;
+	// priv->mbuf_priv_size      = 0;
+
+	// if (rte_mempool_populate_default(pktmbuf_pool) < 0)
+	// 	rte_panic("mempool_populate_default failed\n");
+	// rte_mempool_obj_iter(pktmbuf_pool, rte_pktmbuf_init, NULL);
+
+	for(int i = 0; i < 2048; i++) {
+		queue_hit[i] = skip;
+	}
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)
 	{
