@@ -67,6 +67,7 @@ static uint16_t queues     = 2;
 static bool     aggressive = false;
 bool            verbose    = false;
 uint32_t        skip       = 0;
+uint32_t        skip_count = 0;  // counter for skipped polls
 uint32_t        empty      = 0;
 uint32_t        total      = 0;
 uint32_t        spin_time  = 0;
@@ -224,6 +225,13 @@ print_stats(void)
 	       n_bursts == 0 ? 0 : (float)empty / n_bursts);
 	printf("not-full/burst (resets every second): %.2f\n",
 	       n_bursts == 0 ? 0 : (float)spin_time / n_bursts);
+	if (skip) {
+		uint32_t total_polls = n_bursts + skip_count;
+		printf("Skip stats: %u skipped, %u polled, %.1f%% skipped\n", 
+		       skip_count, n_bursts, total_polls > 0 ? 100.0 * skip_count / total_polls : 0);
+		skip_count = 0;
+	}
+	
 	active    = 0;
 	empty     = 0;
 	spin_time = 0;
@@ -578,7 +586,7 @@ main_loop(__rte_unused void *dummy)
 
 			if ((skip > 0) && (queue_hit[i] < skip)) {
 				queue_hit[i]++;
-				// printf("queue %d skip %d\n", i, queue_hit[i]);
+				skip_count++;
 				continue;
 			}
 
@@ -587,8 +595,6 @@ main_loop(__rte_unused void *dummy)
 				i            = latency_queue; // inietta la coda specificata
 				inject_queue = false;
 			}
-			// printf("queue %d\n", i);
-			// printf("queue %d skip %d\n", i, queue_hit[i]);
 
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
 			n_bursts++;

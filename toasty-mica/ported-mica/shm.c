@@ -168,7 +168,7 @@ mehcached_shm_init(size_t page_size, size_t num_numa_nodes, size_t num_pages_to_
 	{
 		char path[PATH_MAX];
 		mehcached_shm_path(page_id, path);
-		printf("path : %s\n", path);
+		// printf("path : %s\n", path);
 
 		int fd = open(path, O_CREAT | O_RDWR, 0755);
 		if (fd == -1)
