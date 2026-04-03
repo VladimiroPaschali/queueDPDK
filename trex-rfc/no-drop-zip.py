@@ -93,6 +93,7 @@ def export_results_to_csv(bench, policy, queue, repetition, csv_file="benchmark_
         else:
             data = results_json
         
+        # print (f"📊 Risultati JSON: {json.dumps(data, indent=2)}")  # Debug: stampa dati raw
         # Estrai i risultati interni
         results_data = data.get('results', {})
         
@@ -136,6 +137,10 @@ def main(zipf_skew=0.6):
     repetitions = 5
     queues = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
     policies = ["", "-a", "-a -s 5", "-s 20"]
+    # repetitions = 1
+    # queues = [1, 32, 64, 512, 1024, 2048]
+    # policies = ["-a", "-a -s 5", "-s 20"]
+
     
     # Azzera il CSV all'inizio
     csv_file = "benchmark_results.csv"
@@ -180,13 +185,10 @@ def main(zipf_skew=0.6):
             bi_dir=False,
             verbose=False,
             opt_binary_search=True,
+            opt_binary_search_percentage=0.5,
             plugin_file="ndr_plugin_stats.py",
         )
         config.receive_ports = [0]
-
-
-
-        bench = NdrBench(client, config)
 
         print("🚀 Avvio benchmark NDR (zero packet loss)...\n")
 
@@ -196,6 +198,7 @@ def main(zipf_skew=0.6):
             for queue in queues:
                 for repetition in range(repetitions):
                     print(f"\n=== Policy: {policy} | Repetition: {repetition+1}/{repetitions} ===")
+                    bench = NdrBench(client, config)
                     process = launch_program(queue,policy)
                     bench.find_ndr()
                     stop_program(process)
