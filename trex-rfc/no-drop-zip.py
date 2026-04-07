@@ -84,7 +84,7 @@ def launch_program(base_command, queue, policy):
         # Thread per leggere output silenziosamente
         def read_output():
             for line in process.stdout:
-                if "ready" in line.lower():
+                if "ready" in line.lower() or "entering main loop" in line.lower():
                     process._ready_event.set()
         
         reader_thread = threading.Thread(target=read_output, daemon=True)
@@ -311,108 +311,130 @@ def clear_csv_files():
             os.remove(csv_file)
             print(f"🔄 CSV precedente rimosso ({csv_file})")
 
-def main(zipf_skew=0.6):
+def main():
     client = STLClient(server="10.181.120.102")
-    repetitions = 2
+    repetitions = 5
     queues = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
-    policies = ["", "-a", "-a -s 5", "-s 20" , "-a -s 20", "-s 50"]
-    perf = True
-    command = f'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-
-    # repetitions = 1
-    # queues = [1, 32, 64, 512, 1024, 2048]
-    # policies = ["-a", "-a -s 5", "-s 20"]
-
     
-    # Azzera il CSV all'inizio
-    clear_csv_files()
-
+    # Definisci i comandi e le loro configurazioni
+    commands_config = {
+        'chain': {
+            'policies': ["", "-a", "-a -s 5", "-s 20", "-a -s 20", "-s 50"],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
+        },
+        'marco_chain': {
+            'policies': ["", "-a"],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/marco/dpdk-20.11/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1,indirect_queues=1024 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
+        },
+        'mica': {
+            'policies': ["", "-a", "-a -s 5", "-s 20", "-a -s 20", "-s 50"],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica/build/toasty-mica -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- '
+        },
+        'marco_mica': {
+            'policies': ["", "-a"],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/marco/dpdk-20.11/queueDPDK/toasty-mica/build/toasty-mica -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- '
+        }
+    }
+    
+    # Zipf skew values
+    zipf_skews = [0.6, 0.9]
+    
+    # Eventi perf da raccogliere
+    perf_events = [
+        'cycles', 'instructions', 'cache-references', 'cache-misses',
+        'L1-dcache-loads', 'L1-dcache-load-misses', 'L1-dcache-stores',
+        'l2_request.miss', 'l2_request.all', 'dTLB-loads', 'dTLB-load-misses',
+        'LLC-loads', 'LLC-load-misses', 'LLC-stores', 'LLC-stores-misses',
+        'mem_load_l3_miss_retired.local_dram'
+    ]
+    
     try:
         print("Connessione a TRex...")
         client.connect()
-
-        print("Reset porta 0...")
-        client.reset(ports=PORTS)
-
-        print(f"Carico stream da profilo Zipf {zipf_skew} Python...")
         
-        # Usa il profilo zip_profile.py (generatore Zipf nativo)
-        streams = STLProfile.load_py(
-            PROFILE_FILE,
-            direction=0,
-            port_id=0,
-            num_flows=10000,   # numero flussi Zipf (max 20000)
-            skew=zipf_skew,    # parametro Zipf (come zipfpicap.py)
-            packet_size=64     # dimensione pacchetto
-        ).get_streams()
-        
-        print(f"✅ Caricati {len(streams):,} stream dal profilo Zipf\n")
-
-        client.add_streams(streams, ports=PORTS)
-
-        # =========================
-        # CONFIG NDR
-        # =========================
-        config = NdrBenchConfig(
-            ports=PORTS,
-            cores=1,
-            iteration_duration=10.0,
-            first_run_duration=10.0,
-            max_iterations=100,
-            pdr=0.1,          
-            pdr_error=1.0,
-            bi_dir=False,
-            verbose=False,
-            opt_binary_search=True,
-            opt_binary_search_percentage=0.5,
-            plugin_file="ndr_plugin_stats.py",
-        )
-        config.receive_ports = [0]
-
-        print("🚀 Avvio benchmark NDR (zero packet loss)...\n")
-        
-        # Comando base (senza queue e policy)
-        base_command = 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-        
-        # Eventi perf da raccogliere
-        perf_events = [
-            'cycles', 'instructions', 'cache-references', 'cache-misses',
-            'L1-dcache-loads', 'L1-dcache-load-misses', 'L1-dcache-stores',
-            'l2_request.miss', 'l2_request.all', 'dTLB-loads', 'dTLB-load-misses',
-            'LLC-loads', 'LLC-load-misses', 'LLC-stores', 'LLC-stores-misses',
-            'mem_load_l3_miss_retired.local_dram'
-        ]
-
-        t0 = time.time()
-
-        for policy in policies:
-            for queue in queues:                
-                for repetition in range(repetitions):
-                    print(f"\n=== Policy: {policy} | Queue: {queue} | Repetition: {repetition+1}/{repetitions} ===")
-                    bench = NdrBench(client, config)
-                    process = launch_program(base_command, queue, policy)
-                    bench.find_ndr()
-                    stop_program(process)
-                    
-                    # Estrai final_pps dai risultati del benchmark
-                    final_pps = extract_final_pps(bench, policy, queue, repetition+1)
-                    
-                    if final_pps:
-                        # Esegui perf con final_pps per ottenere le metriche
-                        perf_metrics = launch_program_with_perf(base_command, queue, policy, perf_events)
-                        # Esporta risultati benchmark + metriche perf in CSV
-                        export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events)
-
+        # Loop su comandi e skew values
+        for cmd_name, cmd_config in commands_config.items():
+            for zipf_skew in zipf_skews:
+                print(f"\n{'='*80}")
+                print(f"TEST: {cmd_name} | Zipf Skew: {zipf_skew}")
+                print(f"{'='*80}\n")
                 
-                # Calcola e salva la media per questo gruppo di ripetizioni
-                calculate_and_export_averages(perf_events)
-
-        print(f"\nTempo totale: {time.time() - t0:.2f}s")
-
-        print("\n=== RISULTATO FINALE ===")
-        bench.results.print_final()
-
-
+                # Crea cartella per i risultati
+                results_dir = f"results_{cmd_name}_skew{zipf_skew}"
+                os.makedirs(results_dir, exist_ok=True)
+                
+                # Percorsi CSV nella cartella di risultati
+                csv_file = os.path.join(results_dir, "benchmark_results.csv")
+                averages_csv = os.path.join(results_dir, "benchmark_averages.csv")
+                
+                # Azzera il CSV se esiste
+                if os.path.isfile(csv_file):
+                    os.remove(csv_file)
+                
+                print(f"Reset porta 0...")
+                client.reset(ports=PORTS)
+                
+                print(f"Carico stream da profilo Zipf {zipf_skew} Python...")
+                streams = STLProfile.load_py(
+                    PROFILE_FILE,
+                    direction=0,
+                    port_id=0,
+                    num_flows=10000,
+                    skew=zipf_skew,
+                    packet_size=64
+                ).get_streams()
+                
+                print(f"✅ Caricati {len(streams):,} stream dal profilo Zipf\n")
+                client.add_streams(streams, ports=PORTS)
+                
+                # CONFIG NDR
+                config = NdrBenchConfig(
+                    ports=PORTS,
+                    cores=1,
+                    iteration_duration=10.0,
+                    first_run_duration=10.0,
+                    max_iterations=100,
+                    pdr=0.1,          
+                    pdr_error=1.0,
+                    bi_dir=False,
+                    verbose=False,
+                    opt_binary_search=True,
+                    opt_binary_search_percentage=0.5,
+                    plugin_file="ndr_plugin_stats.py",
+                )
+                config.receive_ports = [0]
+                
+                print(f"🚀 Avvio benchmark NDR (zero packet loss)...\n")
+                
+                base_command = cmd_config['base_command']
+                policies = cmd_config['policies']
+                
+                t0 = time.time()
+                
+                for policy in policies:
+                    for queue in queues:                
+                        for repetition in range(repetitions):
+                            print(f"\n=== Policy: {policy} | Queue: {queue} | Repetition: {repetition+1}/{repetitions} ===")
+                            bench = NdrBench(client, config)
+                            process = launch_program(base_command, queue, policy)
+                            bench.find_ndr()
+                            stop_program(process)
+                            
+                            # Estrai final_pps dai risultati del benchmark
+                            final_pps = extract_final_pps(bench, policy, queue, repetition+1)
+                            
+                            if final_pps:
+                                # Esegui perf per ottenere le metriche
+                                perf_metrics = launch_program_with_perf(base_command, queue, policy, perf_events)
+                                # Esporta risultati benchmark + metriche perf in CSV
+                                export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events, csv_file)
+                        
+                        # Calcola e salva la media per questo gruppo di ripetizioni
+                        calculate_and_export_averages(perf_events, csv_file, averages_csv)
+                
+                print(f"\nTempo totale: {time.time() - t0:.2f}s")
+                print(f"\n✅ Risultati salvati in {results_dir}/")
+    
     finally:
         print("\nDisconnessione...")
         client.disconnect()

@@ -9,3 +9,4 @@
 *.csv
 *asni-mica/*
 *.cache/*
+*benchmark_averages.csv
