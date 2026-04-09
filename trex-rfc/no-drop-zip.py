@@ -9,6 +9,7 @@ import os
 import threading
 import re
 import statistics
+from tqdm import tqdm
 sys.path.append("/trex/v3.08/automation/trex_control_plane/interactive")
 from trex.stl.api import STLClient, STLProfile
 from trex.examples.stl.ndr_bench import NdrBench, NdrBenchConfig
@@ -67,7 +68,7 @@ def launch_program(base_command, queue, policy):
     command = f'{base_command} -q {queue} {policy}'
 
     try:
-        print("Running command:", command)
+        tqdm.write("Running command:" + command)
         
         # Crea processo con PIPE per leggere output
         process = sp.Popen(
@@ -92,10 +93,10 @@ def launch_program(base_command, queue, policy):
         
         # Aspetta "ready" con timeout
         if process._ready_event.wait(timeout=15):
-            print("✅ Programma pronto (ready signal ricevuto)")
+            tqdm.write("✅ Programma pronto (ready signal ricevuto)")
             return process
         else:
-            print("⚠️ Timeout: 'ready' non ricevuto entro 15s")
+            tqdm.write("⚠️ Timeout: 'ready' non ricevuto entro 15s")
             return -1
 
     except Exception as e:
@@ -106,7 +107,7 @@ def stop_program(process):
     if process:
         process.terminate()   # tenta chiusura "soft"
         process.wait()        
-        print("Program terminated.")
+        tqdm.write("Program terminated.")
 
 
 def extract_final_pps(bench, policy, queue, repetition):
@@ -185,7 +186,7 @@ def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_e
                 writer.writeheader()
             writer.writerow(row_data)
         
-        print(f"✅ Risultati + perf salvati in {csv_file}")
+        tqdm.write(f"✅ Risultati + perf salvati in {csv_file}")
     except Exception as e:
         print(f"❌ Errore nell'esportazione CSV: {e}")
 
@@ -313,7 +314,7 @@ def clear_csv_files():
 
 def main():
     client = STLClient(server="10.181.120.102")
-    repetitions = 5
+    repetitions = 3
     queues = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
     
     # Definisci i comandi e le loro configurazioni
@@ -352,7 +353,16 @@ def main():
         print("Connessione a TRex...")
         client.connect()
         
-        # Loop su comandi e skew values
+        # Calcola il numero totale di iterazioni
+        total_iterations = sum(
+            len(config['policies']) * len(queues) * repetitions
+            for config in commands_config.values()
+        ) * len(zipf_skews)
+        
+        # Progress bar globale
+        pbar = tqdm(total=total_iterations, desc="Esperimento", unit="test", leave=True)
+        
+        # Loop sui comandi e skew values
         for cmd_name, cmd_config in commands_config.items():
             for zipf_skew in zipf_skews:
                 print(f"\n{'='*80}")
@@ -409,12 +419,11 @@ def main():
                 base_command = cmd_config['base_command']
                 policies = cmd_config['policies']
                 
-                t0 = time.time()
-                
                 for policy in policies:
                     for queue in queues:                
                         for repetition in range(repetitions):
-                            print(f"\n=== Policy: {policy} | Queue: {queue} | Repetition: {repetition+1}/{repetitions} ===")
+                            pbar.set_description(f"[{cmd_name:12} | Q:{queue:4d} | {policy:12} | Rep:{repetition+1}/{repetitions}]")
+                            
                             bench = NdrBench(client, config)
                             process = launch_program(base_command, queue, policy)
                             bench.find_ndr()
@@ -428,12 +437,15 @@ def main():
                                 perf_metrics = launch_program_with_perf(base_command, queue, policy, perf_events)
                                 # Esporta risultati benchmark + metriche perf in CSV
                                 export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events, csv_file)
-                        
+            
+                            pbar.update(1)
                         # Calcola e salva la media per questo gruppo di ripetizioni
                         calculate_and_export_averages(perf_events, csv_file, averages_csv)
+                            
                 
-                print(f"\nTempo totale: {time.time() - t0:.2f}s")
                 print(f"\n✅ Risultati salvati in {results_dir}/")
+        
+        pbar.close()
     
     finally:
         print("\nDisconnessione...")

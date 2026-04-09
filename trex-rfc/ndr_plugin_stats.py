@@ -1,4 +1,5 @@
 import time
+from tqdm import tqdm
 
 class CustomNDRPlugin:
     iter_time = 0.0
@@ -21,8 +22,8 @@ class CustomNDRPlugin:
             # elapsed = run_results.get('Elapsed Time', 0)
             iteration = run_results.get('total_iterations', 'N/A')
             rate_p = run_results.get('rate_p', 0)
-            
-            print(f"  [Iter {iteration}] TX: {tx_pps/1e6:.2f}Mpps | RX: {rx_pps/1e6:.2f}Mpps | Drop: {drop_rate:.3f}% | Rate%: {rate_p:.1f}% | Time: {self.iter_time:.1f}s")
+            tqdm.write(f"  [Iter {iteration}] TX: {tx_pps/1e6:.2f}Mpps | RX: {rx_pps/1e6:.2f}Mpps | Drop: {drop_rate:.3f}% | Rate%: {rate_p:.1f}% | Time: {self.iter_time:.1f}s")
+            # print(f"  [Iter {iteration}] TX: {tx_pps/1e6:.2f}Mpps | RX: {rx_pps/1e6:.2f}Mpps | Drop: {drop_rate:.3f}% | Rate%: {rate_p:.1f}% | Time: {self.iter_time:.1f}s")
         except Exception as e:
             print(f"❌ Plugin error: {e}")
         
