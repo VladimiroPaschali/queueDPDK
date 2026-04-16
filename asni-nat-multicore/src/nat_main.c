@@ -1,8 +1,10 @@
 #include "nat_main.h"
 #include <stdio.h>
+#include <rte_spinlock.h>
 
 struct FlowManager *flow_manager;
 struct nf_config config;
+static rte_spinlock_t flow_manager_lock;
 
 bool nf_init(void) {
 
@@ -33,6 +35,7 @@ bool nf_init(void) {
     config.external_addr = 1 << 24 | 1 << 16 | 1 << 8 | 1;
     config.wan_device = 2;
     config.lan_main_device = 0;
+    rte_spinlock_init(&flow_manager_lock);
 
     flow_manager = flow_manager_allocate(
         config.start_port, config.external_addr, config.wan_device,
@@ -95,8 +98,11 @@ int nf_process(uint16_t device, uint8_t *payload, uint16_t ether_type,
         NF_DEBUG("Device %" PRIu16 " is external", device);
 
         struct FlowId internal_flow;
-        if (flow_manager_get_external(flow_manager, port_dst, now,
-                                      &internal_flow)) {
+        rte_spinlock_lock(&flow_manager_lock);
+        bool has_external_flow =
+            flow_manager_get_external(flow_manager, port_dst, now, &internal_flow);
+        rte_spinlock_unlock(&flow_manager_lock);
+        if (has_external_flow) {
             NF_DEBUG("Found internal flow.");
 
             if (internal_flow.dst_ip != ip_src ||
@@ -131,17 +137,19 @@ int nf_process(uint16_t device, uint8_t *payload, uint16_t ether_type,
                  config.wan_device);
 
         uint16_t external_port;
-        if (!flow_manager_get_internal(flow_manager, &id, now,
-                                       &external_port)) {
+        rte_spinlock_lock(&flow_manager_lock);
+        bool has_internal_flow =
+            flow_manager_get_internal(flow_manager, &id, now, &external_port);
+        if (!has_internal_flow) {
             NF_DEBUG("New flow");
 
-            if (!flow_manager_allocate_flow(flow_manager, &id, device, now,
-                                            &external_port)) {
+            if (!flow_manager_allocate_flow(flow_manager, &id, device, now, &external_port)) {
+                rte_spinlock_unlock(&flow_manager_lock);
                 NF_DEBUG("No space for the flow, dropping");
-                // printf("no space for the flow\n");
-                // return EXPLICIT_DROP;
+                return EXPLICIT_DROP;
             }
         }
+        rte_spinlock_unlock(&flow_manager_lock);
         NF_DEBUG("Forwarding from ext port:%d", external_port);
         // printf("Forwarding from ext port:%d\n", external_port);
         rte_ipv4_header->src_addr = config.external_addr;
