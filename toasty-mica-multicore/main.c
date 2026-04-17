@@ -933,15 +933,16 @@ main(int argc, char **argv)
 
 	table               = &table_o;
 	size_t numa_nodes[] = {(size_t)-1};
+	const bool concurrent_mica = active_io_lcores > 1;
 	// mehcached_table_init(table, 1, 1, 256, false, false, false, numa_nodes[0], numa_nodes,
 	// MEHCACHED_MTH_THRESHOLD_FIFO);
 	mehcached_table_init(table,
 	                     (NUM_KEYS + MEHCACHED_ITEMS_PER_BUCKET - 1) / MEHCACHED_ITEMS_PER_BUCKET,
 	                     1,
 	                     NUM_KEYS * /*MEHCACHED_ROUNDUP64*/ (alloc_overhead + 8 + 8),
-	                     false,
-	                     false,
-	                     false,
+	                     concurrent_mica,
+	                     concurrent_mica,
+	                     concurrent_mica,
 	                     numa_nodes[0],
 	                     numa_nodes,
 	                     MEHCACHED_MTH_THRESHOLD_FIFO);
