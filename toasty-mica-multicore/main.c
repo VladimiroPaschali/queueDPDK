@@ -68,19 +68,9 @@ static uint16_t queues     = 2;
 static bool     aggressive = false;
 bool            verbose    = false;
 uint32_t        skip       = 0;
-uint32_t        skip_count = 0;  // counter for skipped polls
-uint32_t        empty      = 0;
-uint32_t        total      = 0;
-uint32_t        spin_time  = 0;
-uint32_t        n_bursts   = 0;
-uint32_t        spin_pkt   = 0;
-uint32_t        n_pkts     = 0;
 
-static uint64_t timer_period        = 3096000000; // 1 second
-uint64_t        measured_packets_rx = 0;
-
-bool     after_warmup  = false; /* reset statistics after warmup time */
-uint64_t measured_tick = 0;
+static uint64_t timer_period     = 3096000000; // 1 second
+static uint16_t active_io_lcores    = 1;
 
 #define MAX_RX_QUEUE_PER_LCORE 2048
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
@@ -209,37 +199,6 @@ print_stats(void)
 	       (unsigned long long)(total_packets_rx - total_packets_rx_prev),
 	       (unsigned long long)total_packets_dropped,
 	       (unsigned long long)(total_packets_dropped - total_packets_dropped_prev));
-	printf("\nspin/sec (the poll read less than a BURST): %u (%u)\n",
-	       spin_time,
-	       spin_pkt / (spin_time + 1));
-	// printf("miss: %u\n", miss);
-	printf("empty/sec (the poll read no packets): %u\n", empty);
-	printf("not full (resets every second): %u\n", spin_time);
-
-	// printf("total (burst in a second): %u (%u)\n", total, spin_pkt / (total + 1));
-	// printf("packets/burst: %u\n", n_bursts == 0 ? 0 : spin_pkt / n_bursts);
-	printf("n_bursts (resets every second): %u\n", n_bursts);
-	printf("pkts (resets every second): %u\n", n_pkts);
-	printf("pkts/burst (resets every second): %.2f\n",
-	       n_bursts == 0 ? 0 : (float)n_pkts / n_bursts);
-	printf("empty/burst (resets every second): %.2f\n",
-	       n_bursts == 0 ? 0 : (float)empty / n_bursts);
-	printf("not-full/burst (resets every second): %.2f\n",
-	       n_bursts == 0 ? 0 : (float)spin_time / n_bursts);
-	if (skip) {
-		uint32_t total_polls = n_bursts + skip_count;
-		printf("Skip stats: %u skipped, %u polled, %.1f%% skipped\n", 
-		       skip_count, n_bursts, total_polls > 0 ? 100.0 * skip_count / total_polls : 0);
-		skip_count = 0;
-	}
-	
-	active    = 0;
-	empty     = 0;
-	spin_time = 0;
-	spin_pkt  = 0;
-	total     = 0;
-	n_bursts  = 0;
-	n_pkts    = 0;
 	if (aggressive)
 		printf("With aggressive policy\n");
 	else
@@ -250,10 +209,6 @@ print_stats(void)
 		printf("Without skip policy\n");
 	printf("RX queues: %u\n", queues);
 	printf("\n====================================================\n");
-	// if (after_warmup)
-	// 	measured_packets_rx += (total_packets_rx - total_packets_rx_prev);
-	if (after_warmup)
-		measured_tick++;
 	/* Reset previous statistics */
 	total_packets_tx_prev      = total_packets_tx;
 	total_packets_rx_prev      = total_packets_rx;
@@ -420,23 +375,20 @@ mica_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts)
 	return 0;
 }
 
-/* main processing loop */
-uint64_t end_time = 0;
-
 static int
 main_loop(__rte_unused void *dummy)
 {
 	struct rte_mbuf   *pkts_burst[MAX_PKT_BURST];
 	unsigned           lcore_id;
-	uint64_t           prev_tsc, diff_tsc, cur_tsc, timer_tsc, end_warmup;
+	unsigned           lcore_idx;
+	unsigned           nb_active_lcores;
+	uint64_t           prev_tsc, diff_tsc, cur_tsc, timer_tsc;
 	int                i, nb_rx;
-	uint8_t            queueid;
-	struct lcore_conf *qconf;
-	int                socketid;
 	timer_tsc = 0;
 	prev_tsc  = 0;
 	lcore_id  = rte_lcore_id();
-	socketid  = rte_lcore_to_socket_id(lcore_id);
+	lcore_idx = rte_lcore_index(lcore_id);
+	nb_active_lcores = active_io_lcores;
 	int ret;
 
 	int  latency_mode   = 0;
@@ -447,12 +399,30 @@ main_loop(__rte_unused void *dummy)
 	int  latency_queue  = 27; // coda latency con 64 code totali
 	// int latency_queue = queues -1 ; // ultima coda simulata latency
 
-	printf("entering main loop on lcore %u\n", lcore_id);
+	uint16_t       first_queue     = queues;
+	uint16_t       assigned_queues = 0;
+	const uint16_t tx_queue_id     = (uint16_t)lcore_idx;
+	if (lcore_idx < nb_active_lcores) {
+		const uint16_t queues_per_lcore = queues / nb_active_lcores;
+		const uint16_t extra_queues     = queues % nb_active_lcores;
+		first_queue =
+		    (uint16_t)(lcore_idx * queues_per_lcore + RTE_MIN(lcore_idx, extra_queues));
+		assigned_queues = (uint16_t)(queues_per_lcore + (lcore_idx < extra_queues));
+	}
+	const uint16_t last_queue      = first_queue + assigned_queues;
+	const bool     has_latency_queue =
+	    (latency_queue >= first_queue) && (latency_queue < last_queue);
 
-	uint64_t start_time  = rte_rdtsc();
-	uint64_t warmup_time = 3 * rte_get_timer_hz();
-	uint64_t stop_time   = (10 * rte_get_timer_hz()) + warmup_time;
-	// uint64_t stop_time   = (2 * rte_get_timer_hz()) + warmup_time;
+	if (assigned_queues == 0) {
+		printf("entering main loop on lcore %u (idle, no RX queues assigned)\n", lcore_id);
+		return 0;
+	}
+	printf("entering main loop on lcore %u (rx queues [%u, %u), tx queue %u)\n",
+	       lcore_id,
+	       first_queue,
+	       last_queue,
+	       tx_queue_id);
+	fflush(stdout);
 
 	while (!force_quit) {
 
@@ -470,7 +440,7 @@ main_loop(__rte_unused void *dummy)
 			if (unlikely(timer_tsc >= timer_period)) {
 				/* do this only on main core */
 				if (lcore_id == rte_get_main_lcore()) {
-					print_stats();
+					// print_stats();
 					/* reset the timer */
 					timer_tsc = 0;
 				}
@@ -483,42 +453,34 @@ main_loop(__rte_unused void *dummy)
 		 */
 		int max_loops = 100;
 
-		for (i = 0; i < queues; ++i) {
+		for (i = first_queue; i < last_queue; ++i) {
 
 			if ((skip > 0) && (queue_hit[i] < skip)) {
 				queue_hit[i]++;
-				skip_count++;
 				continue;
 			}
 
-			if (latency_mode && inject_queue) {
+			if (latency_mode && has_latency_queue && inject_queue) {
 				resume_i     = i;             // salva dove dovevi andare
 				i            = latency_queue; // inietta la coda specificata
 				inject_queue = false;
 			}
 
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
-			n_bursts++;
-			n_pkts += nb_rx;
 
 			if (nb_rx > 0) {
 
 				ret = mica_process_burst(pkts_burst, nb_rx);
 				if (ret == 1) {
 					printf("Received stop signal, exiting main loop\n");
-					end_time   = cur_tsc - end_warmup;
 					force_quit = true;
 					break;
 				}
 
-				uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+				uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, pkts_burst, nb_rx);
 
-				port_statistics[portid][i].rx += nb_rx;
-				if (after_warmup) {
-					measured_packets_rx += nb_rx;
-				}
 			}
-			if (latency_mode) {
+			if (latency_mode && has_latency_queue) {
 
 				/* se abbiamo appena fatto una 27 iniettata */
 				if (resume_i != -1 && i == latency_queue) {
@@ -547,28 +509,8 @@ main_loop(__rte_unused void *dummy)
 			} else {
 				max_loops = 100;
 			}
-
-			if (nb_rx < MAX_PKT_BURST) {
-				spin_time++;
-			}
-			spin_pkt += nb_rx;
-			if (nb_rx == 0) {
-				empty++;
-			}
-		}
-		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
-			end_time = cur_tsc - end_warmup;
-			// uncomment below to stop after 13 seconds of measurement
-			// break;
-		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
-			// rte_eth_stats_reset(portid); // skip the first 3 seconds
-			printf("Warmup finished\n");
-			after_warmup = true;
-			end_warmup   = cur_tsc;
-			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
 		}
 	}
-	end_time = rte_rdtsc() - end_warmup;
 	return 0;
 }
 
@@ -816,7 +758,7 @@ signal_handler(int signum)
 int
 main(int argc, char **argv)
 {
-	uint16_t                   nb_lcores = rte_lcore_count();
+	uint16_t                   nb_lcores = 0;
 	unsigned                   lcore_id;
 	static struct rte_mempool *mbuf_pool;
 
@@ -835,6 +777,9 @@ main(int argc, char **argv)
 	ret = parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid MICA parameters\n");
+	nb_lcores = rte_lcore_count();
+	if (nb_lcores == 0)
+		rte_exit(EXIT_FAILURE, "No enabled lcores\n");
 
 	uint16_t nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
@@ -852,15 +797,6 @@ main(int argc, char **argv)
 	for (int i = 0; i < 2048; i++) {
 		queue_hit[i] = skip;
 	}
-
-	/* Configure port */
-	struct rte_eth_conf port_conf = {0};
-	port_conf.rxmode.mq_mode      = ETH_MQ_RX_NONE;
-	uint16_t n_tx_queue           = 1;
-
-	ret = rte_eth_dev_configure(portid, (uint16_t)queues, (uint16_t)n_tx_queue, &port_conf);
-	if (ret < 0)
-		rte_exit(EXIT_FAILURE, "Configure failed\n");
 
 	// QueueDPDK setup
 	// Check correct bitstream
@@ -880,6 +816,24 @@ main(int argc, char **argv)
 		printf("wrong bitstream\n");
 		return 0;
 	}
+
+	active_io_lcores = RTE_MIN(nb_lcores, (uint16_t)queues);
+	active_io_lcores = RTE_MIN(active_io_lcores, dev_info.max_tx_queues);
+	if (active_io_lcores == 0)
+		rte_exit(EXIT_FAILURE,
+		         "Invalid lcore/queue setup: lcores=%u queues=%u max_tx_queues=%u\n",
+		         nb_lcores,
+		         queues,
+		         dev_info.max_tx_queues);
+
+	/* Configure port */
+	struct rte_eth_conf port_conf = {0};
+	port_conf.rxmode.mq_mode      = ETH_MQ_RX_NONE;
+	uint16_t n_tx_queue           = active_io_lcores;
+
+	ret = rte_eth_dev_configure(portid, (uint16_t)queues, n_tx_queue, &port_conf);
+	if (ret < 0)
+		rte_exit(EXIT_FAILURE, "Configure failed\n");
 
 	struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
 	for (int i = 0; i < dev_info.reta_size / RTE_RETA_GROUP_SIZE; i++) {
@@ -904,12 +858,9 @@ main(int argc, char **argv)
 	// End QueueDPDK setup
 
 	/* RX queue */
-	RTE_LCORE_FOREACH(lcore_id)
 	{
-		struct rte_eth_rxconf rxq_conf;
-
-		rxq_conf          = dev_info.default_rxconf;
-		rxq_conf.offloads = port_conf.rxmode.offloads;
+		struct rte_eth_rxconf rxq_conf = dev_info.default_rxconf;
+		rxq_conf.offloads              = port_conf.rxmode.offloads;
 
 		for (int x = 0; x < queues; x++) {
 			int diag = rte_pmd_qdma_set_queue_mode(portid, x, RTE_PMD_QDMA_STREAMING_MODE);
@@ -927,16 +878,15 @@ main(int argc, char **argv)
 	}
 
 	/* TX queue */
-	RTE_LCORE_FOREACH(lcore_id)
 	{
-		struct rte_eth_txconf *txconf;
-		txconf            = &dev_info.default_txconf;
-		txconf->offloads  = port_conf.txmode.offloads;
-		uint16_t queue_id = rte_lcore_index(lcore_id);
-		ret =
-		    rte_eth_tx_queue_setup(portid, queue_id, nb_txd, rte_eth_dev_socket_id(portid), txconf);
-		if (ret < 0)
-			rte_exit(EXIT_FAILURE, "TX queue setup failed\n");
+		struct rte_eth_txconf *txconf = &dev_info.default_txconf;
+		txconf->offloads              = port_conf.txmode.offloads;
+		for (uint16_t queue_id = 0; queue_id < active_io_lcores; queue_id++) {
+			ret = rte_eth_tx_queue_setup(
+			    portid, queue_id, nb_txd, rte_eth_dev_socket_id(portid), txconf);
+			if (ret < 0)
+				rte_exit(EXIT_FAILURE, "TX queue setup failed (queue=%u, err=%d)\n", queue_id, ret);
+		}
 	}
 
 	/* Start port */
@@ -1027,12 +977,7 @@ main(int argc, char **argv)
 
 	mehcached_table_free(table);
 
-	print_stats();
-
-	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
-	printf("measured RX Throughput: %.2f\n",
-	       (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
-	printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
+	// print_stats();
 
 	return 0;
 }
