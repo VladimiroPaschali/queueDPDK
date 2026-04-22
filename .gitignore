@@ -10,3 +10,4 @@
 *asni-mica/*
 *.cache/*
 *benchmark_averages.csv
+*perf.data*

@@ -270,7 +270,10 @@ struct five_tuple {
 static int VALUE_SIZE = 1400;
 size_t     default_keys[NUM_KEYS];
 int        keys_index = 0;
-bool       flag       = false;
+struct get_set_toggle_state {
+	bool flag;
+} __rte_cache_aligned;
+static struct get_set_toggle_state get_set_toggle[RTE_MAX_LCORE];
 static int get_ratio = 50; // 70% GET, 30% STORE
 
 static int
@@ -298,8 +301,9 @@ mica_process5tuple(uint8_t *pkt)
     key.proto    = ip->next_proto_id;
 
     // int do_get = (rand() % 100) < get_ratio;
-	int do_get = flag;
-	flag   = !flag;
+	unsigned lcore_id = rte_lcore_id();
+	int do_get = get_set_toggle[lcore_id].flag;
+	get_set_toggle[lcore_id].flag = !get_set_toggle[lcore_id].flag;
 
     uint64_t key_hash =
         hash((const uint8_t *)&key, sizeof(key));

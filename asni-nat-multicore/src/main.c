@@ -1407,7 +1407,6 @@ is_valid_ipv4_pkt(struct rte_ipv4_hdr *pkt, uint32_t link_len)
 	return 0;
 }
 #endif
-int queue_hit[2048] = {1};
 static void
 print_stats(void)
 {
@@ -1582,15 +1581,12 @@ static int
 main_loop(__rte_unused void *dummy)
 {
 	struct rte_mbuf   *pkts_burst[MAX_PKT_BURST];
+	int                queue_hit_local[MAX_RX_QUEUE_PER_LCORE];
 	unsigned           lcore_id;
-	uint64_t           prev_tsc, diff_tsc, cur_tsc, timer_tsc;
 	int                i, nb_rx;
 	uint16_t           portid;
 	struct lcore_conf *qconf;
 	int                socketid;
-	const uint64_t     drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
-	timer_tsc                    = 0;
-	prev_tsc                     = 0;
 	lcore_id                     = rte_lcore_id();
 	qconf                        = &lcore_conf[lcore_id];
 	socketid                     = rte_lcore_to_socket_id(lcore_id);
@@ -1622,6 +1618,9 @@ main_loop(__rte_unused void *dummy)
 
 	if (total_lcores == 0)
 		total_lcores = 1;
+
+	for (i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++)
+		queue_hit_local[i] = skip;
 
 	queue_start = (int)(((uint32_t)queues * lcore_pos) / total_lcores);
 	queue_end   = (int)(((uint32_t)queues * (lcore_pos + 1)) / total_lcores);
@@ -1659,28 +1658,6 @@ main_loop(__rte_unused void *dummy)
 
 	while (!force_quit) {
 
-		cur_tsc = rte_rdtsc();
-
-		/*
-		 * TX burst queue drain
-		 */
-		diff_tsc = cur_tsc - prev_tsc;
-		/* if timer is enabled */
-		if (timer_period > 0) {
-			/* advance the timer */
-			timer_tsc += diff_tsc;
-			/* if timer has reached its timeout */
-			if (unlikely(timer_tsc >= timer_period)) {
-				/* do this only on main core */
-				if (lcore_id == rte_get_main_lcore()) {
-					print_stats();
-					/* reset the timer */
-					timer_tsc = 0;
-				}
-			}
-		}
-		prev_tsc = cur_tsc;
-
 		/*
 		 * Read packet from RX queues
 		 */
@@ -1688,9 +1665,9 @@ main_loop(__rte_unused void *dummy)
 
 		for (i = queue_start; i < queue_end; ++i) {
 
-			if ((skip > 0) && (queue_hit[i] < skip)) {
-				queue_hit[i]++;
-				// printf("queue %d skip %d\n", i, queue_hit[i]);
+			if ((skip > 0) && (queue_hit_local[i] < skip)) {
+				queue_hit_local[i]++;
+				// printf("queue %d skip %d\n", i, queue_hit_local[i]);
 				continue;
 			}
 
@@ -1700,7 +1677,7 @@ main_loop(__rte_unused void *dummy)
 				inject_queue = false;
 			}
 			// printf("queue %d\n", i);
-			// printf("queue %d skip %d\n", i, queue_hit[i]);
+			// printf("queue %d skip %d\n", i, queue_hit_local[i]);
 
 			portid = rx_portid;
 			// queueid = qconf->rx_queue_list[i].queue_id;
@@ -1729,8 +1706,6 @@ main_loop(__rte_unused void *dummy)
 					                 acl_search.res_ipv4,
 					                 acl_search.num_ipv4,
 					                 DEFAULT_MAX_CATEGORIES);
-
-
 				}
 
 				if (acl_search.num_ipv6) {
@@ -1739,7 +1714,6 @@ main_loop(__rte_unused void *dummy)
 					                 acl_search.res_ipv6,
 					                 acl_search.num_ipv6,
 					                 DEFAULT_MAX_CATEGORIES);
-
 				}
 				// send_packets_always(pkts_burst, NULL, nb_rx, portid);
 				// printf("core %u rx %d tx %d processed %d packets\n", lcore_id, i, tx_queueid, nb_rx);
@@ -1770,7 +1744,7 @@ main_loop(__rte_unused void *dummy)
 			}
 
 			if (skip > 0 && max_loops == 100)
-				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
+				queue_hit_local[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 				if (i > queue_start) {
@@ -2518,9 +2492,6 @@ main(int argc, char **argv)
 	// 	rte_panic("mempool_populate_default failed\n");
 	// rte_mempool_obj_iter(pktmbuf_pool, rte_pktmbuf_init, NULL);
 
-	for (int i = 0; i < 2048; i++) {
-		queue_hit[i] = skip;
-	}
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)
 	{

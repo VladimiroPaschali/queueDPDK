@@ -1,10 +1,26 @@
 #include "nat_main.h"
 #include <stdio.h>
-#include <rte_spinlock.h>
+#include <limits.h>
+#include <arpa/inet.h>
+#include <rte_lcore.h>
 
-struct FlowManager *flow_manager;
 struct nf_config config;
-static rte_spinlock_t flow_manager_lock;
+
+struct nat_shard {
+    struct FlowManager *manager;
+};
+
+static struct nat_shard nat_shards[RTE_MAX_LCORE];
+
+static inline struct nat_shard *get_nat_shard_for_lcore(unsigned lcore_id) {
+    if (lcore_id >= RTE_MAX_LCORE) {
+        return NULL;
+    }
+    if (nat_shards[lcore_id].manager == NULL) {
+        return NULL;
+    }
+    return &nat_shards[lcore_id];
+}
 
 bool nf_init(void) {
 
@@ -35,13 +51,42 @@ bool nf_init(void) {
     config.external_addr = 1 << 24 | 1 << 16 | 1 << 8 | 1;
     config.wan_device = 2;
     config.lan_main_device = 0;
-    rte_spinlock_init(&flow_manager_lock);
 
-    flow_manager = flow_manager_allocate(
-        config.start_port, config.external_addr, config.wan_device,
-        config.expiration_time, config.max_flows);
+    if (config.max_flows == 0) {
+        return false;
+    }
+    if ((uint32_t)config.start_port + config.max_flows > (uint32_t)UINT16_MAX + 1U) {
+        return false;
+    }
 
-    return flow_manager != NULL;
+    const unsigned nb_lcores = rte_lcore_count();
+    if (nb_lcores == 0 || nb_lcores > config.max_flows) {
+        return false;
+    }
+
+    memset(nat_shards, 0, sizeof(nat_shards));
+
+    const uint32_t base_flows = config.max_flows / nb_lcores;
+    const uint32_t remainder = config.max_flows % nb_lcores;
+    uint32_t shard_start = config.start_port;
+    unsigned shard_index = 0;
+    unsigned lcore_id;
+
+    RTE_LCORE_FOREACH(lcore_id) {
+        const uint32_t shard_flows = base_flows + (shard_index < remainder ? 1U : 0U);
+        struct FlowManager *manager = flow_manager_allocate(
+            (uint16_t)shard_start, config.external_addr, config.wan_device,
+            config.expiration_time, shard_flows);
+        if (manager == NULL) {
+            return false;
+        }
+        nat_shards[lcore_id].manager = manager;
+
+        shard_start += shard_flows;
+        shard_index++;
+    }
+
+    return true;
 }
 void uint32_to_ipv4(uint32_t ip, char *buffer) {
     struct in_addr addr;
@@ -55,6 +100,13 @@ void uint32_to_ipv4(uint32_t ip, char *buffer) {
 int nf_process(uint16_t device, uint8_t *payload, uint16_t ether_type,
                uint8_t ip_proto, uint32_t ip_src, uint32_t ip_dst,
                uint16_t port_src, uint16_t port_dst, vigor_time_t now) {
+    const unsigned lcore_id = rte_lcore_id();
+    struct nat_shard *nat_shard = get_nat_shard_for_lcore(lcore_id);
+    if (nat_shard == NULL) {
+        return EXPLICIT_DROP;
+    }
+    struct FlowManager *flow_manager = nat_shard->manager;
+
     //flow_manager_expire(flow_manager, now);
 
 #ifdef ENABLE_LOG
@@ -98,10 +150,8 @@ int nf_process(uint16_t device, uint8_t *payload, uint16_t ether_type,
         NF_DEBUG("Device %" PRIu16 " is external", device);
 
         struct FlowId internal_flow;
-        rte_spinlock_lock(&flow_manager_lock);
         bool has_external_flow =
             flow_manager_get_external(flow_manager, port_dst, now, &internal_flow);
-        rte_spinlock_unlock(&flow_manager_lock);
         if (has_external_flow) {
             NF_DEBUG("Found internal flow.");
 
@@ -137,19 +187,16 @@ int nf_process(uint16_t device, uint8_t *payload, uint16_t ether_type,
                  config.wan_device);
 
         uint16_t external_port;
-        rte_spinlock_lock(&flow_manager_lock);
         bool has_internal_flow =
             flow_manager_get_internal(flow_manager, &id, now, &external_port);
         if (!has_internal_flow) {
             NF_DEBUG("New flow");
 
             if (!flow_manager_allocate_flow(flow_manager, &id, device, now, &external_port)) {
-                rte_spinlock_unlock(&flow_manager_lock);
                 NF_DEBUG("No space for the flow, dropping");
                 return EXPLICIT_DROP;
             }
         }
-        rte_spinlock_unlock(&flow_manager_lock);
         NF_DEBUG("Forwarding from ext port:%d", external_port);
         // printf("Forwarding from ext port:%d\n", external_port);
         rte_ipv4_header->src_addr = config.external_addr;
