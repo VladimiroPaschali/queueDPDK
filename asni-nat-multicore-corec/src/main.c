@@ -47,6 +47,7 @@
 #include <rte_udp.h>
 #include <rte_string_fns.h>
 #include <rte_acl.h>
+#include <rte_spinlock.h>
 
 #include <cmdline_parse.h>
 #include <cmdline_parse_etheraddr.h>
@@ -124,7 +125,8 @@ struct lcore_rx_queue {
 
 #define MAX_RX_QUEUE_PER_LCORE 2048
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
-#define MAX_RX_QUEUE_PER_PORT 128
+#define MAX_RX_QUEUE_PER_PORT 2048
+static rte_spinlock_t rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
 
 #define MAX_LCORE_PARAMS 1024
 struct lcore_params {
@@ -149,6 +151,16 @@ static struct lcore_params lcore_params_array_default[] = {
 static struct lcore_params *lcore_params = lcore_params_array_default;
 static uint16_t             nb_lcore_params =
     sizeof(lcore_params_array_default) / sizeof(lcore_params_array_default[0]);
+
+static void
+init_rx_queue_locks(void)
+{
+	for (uint16_t pid = 0; pid < RTE_MAX_ETHPORTS; pid++) {
+		for (uint16_t qid = 0; qid < MAX_RX_QUEUE_PER_PORT; qid++) {
+			rte_spinlock_init(&rx_queue_locks[pid][qid]);
+		}
+	}
+}
 
 static struct rte_eth_conf port_conf = {
     .rxmode =
@@ -1622,8 +1634,13 @@ main_loop(__rte_unused void *dummy)
 	for (i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++)
 		queue_hit_local[i] = skip;
 
-	queue_start = (int)(((uint32_t)queues * lcore_pos) / total_lcores);
-	queue_end   = (int)(((uint32_t)queues * (lcore_pos + 1)) / total_lcores);
+	if (queues > MAX_RX_QUEUE_PER_PORT) {
+		RTE_LOG(ERR, L3FWD, "invalid number of RX queues %u\n", queues);
+		return -1;
+	}
+
+	queue_start = 0;
+	queue_end   = (int)queues;
 	tx_queueid  = (uint16_t)lcore_pos;
 
 	if (tx_queueid >= MAX_TX_QUEUE_PER_PORT) {
@@ -1681,7 +1698,11 @@ main_loop(__rte_unused void *dummy)
 
 			portid = rx_portid;
 			// queueid = qconf->rx_queue_list[i].queue_id;
+			nb_rx = 0;
+			if (!rte_spinlock_trylock(&rx_queue_locks[portid][i]))
+				continue;
 			nb_rx = rte_eth_rx_burst(portid, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
+			rte_spinlock_unlock(&rx_queue_locks[portid][i]);
 			// printf("core %u queue %d received %d packets\n", lcore_id, i, nb_rx);
 
 			if (nb_rx > 0) {
@@ -2712,6 +2733,7 @@ main(int argc, char **argv)
 			cm->values[i][j] = 0;
 		}
 	}
+	init_rx_queue_locks();
 	check_all_ports_link_status(enabled_port_mask);
 
 	sleep(3);

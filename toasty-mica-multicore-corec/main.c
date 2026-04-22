@@ -45,6 +45,7 @@
 #include <rte_udp.h>
 #include <rte_string_fns.h>
 #include <rte_acl.h>
+#include <rte_spinlock.h>
 
 #include <cmdline_parse.h>
 #include <cmdline_parse_etheraddr.h>
@@ -75,6 +76,7 @@ static uint16_t active_io_lcores    = 1;
 #define MAX_RX_QUEUE_PER_LCORE 2048
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
 #define MAX_RX_QUEUE_PER_PORT 128
+static rte_spinlock_t rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
 
 /* Per-port statistics struct */
 struct port_statistics {
@@ -107,6 +109,16 @@ static struct lcore_params lcore_params_array_default[] = {
 static struct lcore_params *lcore_params = lcore_params_array_default;
 static uint16_t             nb_lcore_params =
     sizeof(lcore_params_array_default) / sizeof(lcore_params_array_default[0]);
+
+static void
+init_rx_queue_locks(void)
+{
+	for (uint16_t pid = 0; pid < RTE_MAX_ETHPORTS; pid++) {
+		for (uint16_t qid = 0; qid < MAX_RX_QUEUE_PER_PORT; qid++) {
+			rte_spinlock_init(&rx_queue_locks[pid][qid]);
+		}
+	}
+}
 
 static struct rte_eth_conf port_conf = {
     .rxmode =
@@ -407,11 +419,8 @@ main_loop(__rte_unused void *dummy)
 	uint16_t       assigned_queues = 0;
 	const uint16_t tx_queue_id     = (uint16_t)lcore_idx;
 	if (lcore_idx < nb_active_lcores) {
-		const uint16_t queues_per_lcore = queues / nb_active_lcores;
-		const uint16_t extra_queues     = queues % nb_active_lcores;
-		first_queue =
-		    (uint16_t)(lcore_idx * queues_per_lcore + RTE_MIN(lcore_idx, extra_queues));
-		assigned_queues = (uint16_t)(queues_per_lcore + (lcore_idx < extra_queues));
+		first_queue = 0;
+		assigned_queues = queues;
 	}
 	const uint16_t last_queue      = first_queue + assigned_queues;
 	const bool     has_latency_queue =
@@ -470,7 +479,11 @@ main_loop(__rte_unused void *dummy)
 				inject_queue = false;
 			}
 
+			nb_rx = 0;
+			if (!rte_spinlock_trylock(&rx_queue_locks[portid][i]))
+				continue;
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
+			rte_spinlock_unlock(&rx_queue_locks[portid][i]);
 
 			if (nb_rx > 0) {
 
@@ -788,6 +801,8 @@ main(int argc, char **argv)
 	uint16_t nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No available ports\n");
+	if (queues > MAX_RX_QUEUE_PER_PORT)
+		rte_exit(EXIT_FAILURE, "Too many RX queues: %u > %u\n", queues, MAX_RX_QUEUE_PER_PORT);
 
 	/* ---- Mempool ---- */
 	int nb_mbufs = RTE_MAX(
@@ -801,6 +816,7 @@ main(int argc, char **argv)
 	for (int i = 0; i < 2048; i++) {
 		queue_hit[i] = skip;
 	}
+	init_rx_queue_locks();
 
 	// QueueDPDK setup
 	// Check correct bitstream
