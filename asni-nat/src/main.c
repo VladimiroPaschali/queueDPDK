@@ -187,7 +187,8 @@ static struct rte_eth_conf port_conf = {
 };
 
 // static struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
-struct rte_mempool *pktmbuf_pool = NULL;
+// struct rte_mempool *pktmbuf_pool = NULL;
+struct rte_mempool *pktmbuf_pool[1024] = {NULL};
 
 /* ethernet addresses of ports */
 static struct rte_ether_hdr port_l2hdr[RTE_MAX_ETHPORTS];
@@ -1556,6 +1557,71 @@ print_stats(void)
 	fflush(stdout);
 }
 
+static int
+print_queue_packet_histogram_cmp_desc(const void *a, const void *b)
+{
+	struct queue_pkt_entry {
+		unsigned q;
+		uint64_t packets;
+	};
+	const struct queue_pkt_entry *ea = (const struct queue_pkt_entry *)a;
+	const struct queue_pkt_entry *eb = (const struct queue_pkt_entry *)b;
+
+	if (ea->packets < eb->packets)
+		return 1;
+	if (ea->packets > eb->packets)
+		return -1;
+	if (ea->q < eb->q)
+		return -1;
+	if (ea->q > eb->q)
+		return 1;
+	return 0;
+}
+
+static void
+print_queue_packet_histogram(void)
+{
+	struct queue_pkt_entry {
+		unsigned q;
+		uint64_t packets;
+	};
+	struct queue_pkt_entry entries[MAX_RX_QUEUE_PER_LCORE];
+	uint64_t total_packets = 0;
+	unsigned n_queues   = queues < MAX_RX_QUEUE_PER_LCORE ? queues : MAX_RX_QUEUE_PER_LCORE;
+
+	for (unsigned q = 0; q < n_queues; q++) {
+		entries[q].q       = q;
+		entries[q].packets = 0;
+	}
+
+	for (unsigned portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+		if ((enabled_port_mask & (1 << portid)) == 0)
+			continue;
+
+		for (unsigned q = 0; q < n_queues; q++) {
+			entries[q].packets += port_statistics[portid][q].rx;
+		}
+	}
+
+	for (unsigned q = 0; q < n_queues; q++)
+		total_packets += entries[q].packets;
+
+	qsort(entries, n_queues, sizeof(entries[0]), print_queue_packet_histogram_cmp_desc);
+
+	printf("\nPacket histogram per queue (total processed) ============\n");
+	printf("Total packets: %'llu\n", (unsigned long long)total_packets);
+
+	for (unsigned i = 0; i < n_queues; i++) {
+		double pct =
+		    total_packets ? (100.0 * (double)entries[i].packets / (double)total_packets) : 0.0;
+		printf("queue=%3u -> %'20llu (%6.2f%%)\n",
+		       entries[i].q,
+		       (unsigned long long)entries[i].packets,
+		       pct);
+	}
+	printf("==========================================================\n");
+}
+
 static inline uint32_t
 str_to_u32(const char s[4])
 {
@@ -1748,8 +1814,9 @@ main_loop(__rte_unused void *dummy)
 	int  resume_i       = -1;
 	int  latency_queue  = 27; // coda latency con 64 code totali
 	// int latency_queue = queues -1 ; // ultima coda simulata latency
-
+	printf("ready\n");
 	RTE_LOG(INFO, L3FWD, "entering main loop on lcore %u\n", lcore_id);
+	fflush(stdout);
 
 	uint64_t start_time  = rte_rdtsc();
 	uint64_t warmup_time = 3 * rte_get_timer_hz();
@@ -1806,7 +1873,6 @@ main_loop(__rte_unused void *dummy)
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
 			n_bursts++;
 			n_pkts += nb_rx;
-
 
 			if (nb_rx > 0) {
 				// printf("queueid=%hhu\n", queueid);
@@ -1875,7 +1941,7 @@ main_loop(__rte_unused void *dummy)
 			}
 
 			if (skip > 0 && max_loops == 100)
-				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST/2);
+				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 				if (i > 0) {
@@ -1885,7 +1951,6 @@ main_loop(__rte_unused void *dummy)
 			} else {
 				max_loops = 100;
 			}
-			
 
 			if (nb_rx < MAX_PKT_BURST) {
 				spin_time++;
@@ -2166,7 +2231,7 @@ parse_args(int argc, char **argv)
 	                                 {NULL, 0, 0, 0}};
 
 	static const char short_options[] = "q:" /* queues  */
-										"d:" /* descriptors  */
+	                                    "d:" /* descriptors  */
 	                                    "a"  /* agressive */
 	                                    "v"  /* verbose */
 	                                    "s:" /* skip  */
@@ -2180,7 +2245,7 @@ parse_args(int argc, char **argv)
 		switch (opt) {
 		case 'd':
 			nb_rxd = parse_queues(optarg);
-			//non è potenza del 2
+			// non è potenza del 2
 			if (nb_rxd < 64 || (nb_rxd & (nb_rxd - 1)) != 0) {
 				printf("invalid number of descriptors\n");
 				return -1;
@@ -2483,6 +2548,66 @@ signal_handler(int signum)
 	}
 }
 
+static struct rte_mempool *
+create_extbuf_pool(const char *name,
+                   uint16_t    nb_ports,
+                   uint16_t    rx_queue_per_lcore,
+                   uint16_t    nb_rxd,
+                   uint16_t    nb_txd,
+                   uint16_t    nb_lcores,
+                   int         socket_id)
+{
+	uint32_t nb_mbuf;
+
+	nb_mbuf = RTE_MAX(rx_queue_per_lcore * nb_ports *
+	                      (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE),
+	                  8192U);
+
+	const uint16_t data_room_size = RTE_MBUF_DEFAULT_BUF_SIZE;
+	const uint16_t priv_size      = 0;
+
+	/* Total memory needed */
+	size_t buf_len    = RTE_ALIGN_CEIL(192 + data_room_size, RTE_CACHE_LINE_SIZE); // 2368 2176
+	size_t total_size = (size_t)nb_mbuf * buf_len;
+
+	/* Allocate contiguous DMA-safe memory */
+	void *buf_addr = rte_malloc(NULL, total_size, RTE_CACHE_LINE_SIZE);
+	if (!buf_addr) {
+		rte_exit(EXIT_FAILURE, "Cannot allocate extbuf memory\n");
+	}
+
+	/* Get IOVA */
+	rte_iova_t buf_iova = rte_malloc_virt2iova(buf_addr);
+	if (buf_iova == RTE_BAD_IOVA) {
+		rte_exit(EXIT_FAILURE, "IOVA translation failed\n");
+	}
+
+	/* Describe external memory region */
+	struct rte_pktmbuf_extmem extmem = {
+	    .buf_ptr  = buf_addr,
+	    .buf_iova = buf_iova,
+	    .buf_len  = total_size,
+	    .elt_size = buf_len,
+	};
+
+	/* Create mempool */
+	struct rte_mempool *mp = rte_pktmbuf_pool_create_extbuf(name,
+	                                                        nb_mbuf,
+	                                                        MEMPOOL_CACHE_SIZE,
+	                                                        priv_size,
+	                                                        data_room_size,
+	                                                        socket_id,
+	                                                        &extmem,
+	                                                        1 /* number of extmem segments */
+	);
+
+	if (mp == NULL) {
+		rte_exit(EXIT_FAILURE, "Cannot create extbuf pool\n");
+	}
+
+	return mp;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2543,19 +2668,33 @@ main(int argc, char **argv)
 	int nb_mbufs = RTE_MAX(
 	    queues * 1 * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
 
-	/* create the mbuf pool */
-	pktmbuf_pool = rte_pktmbuf_pool_create(
-	    "mbuf_pool", nb_mbufs, MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
-	    rte_socket_id());
-	// pktmbuf_pool = rte_mempool_create_empty("mbuf_pool",
-	//                                         nb_mbufs,
-	//                                         RTE_MBUF_DEFAULT_BUF_SIZE + sizeof(struct rte_mbuf),
-	//                                         MEMPOOL_CACHE_SIZE,
-	//                                         sizeof(struct rte_pktmbuf_pool_private),
-	//                                         SOCKET_ID_ANY,
-	//                                         rte_socket_id());
-	if (pktmbuf_pool == NULL)
-		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+	int contiguous = 0;
+	if (!contiguous) {
+		/* create the mbuf pool */
+		pktmbuf_pool[0] = rte_pktmbuf_pool_create("mbuf_pool",
+		                                          nb_mbufs,
+		                                          MEMPOOL_CACHE_SIZE,
+		                                          0,
+		                                          RTE_MBUF_DEFAULT_BUF_SIZE,
+		                                          rte_socket_id());
+
+		if (pktmbuf_pool[0] == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+
+	} else {
+		for (int i = 0; i < queues; i++) {
+			char pool_name[32];
+			snprintf(pool_name, sizeof(pool_name), "mbuf_pool_%d", i);
+			nb_mbufs =
+			    nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE);
+
+			pktmbuf_pool[i] = create_extbuf_pool(
+			    pool_name, nb_ports, 1, nb_rxd, nb_txd, nb_lcores, rte_socket_id());
+
+			if (pktmbuf_pool[i] == NULL)
+				rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+		}
+	}
 
 	// if (rte_mempool_set_ops_byname(pktmbuf_pool, "stack", NULL) < 0)
 	// 	rte_panic("mempool_set_ops stack failed\n");
@@ -2569,7 +2708,7 @@ main(int argc, char **argv)
 	// 	rte_panic("mempool_populate_default failed\n");
 	// rte_mempool_obj_iter(pktmbuf_pool, rte_pktmbuf_init, NULL);
 
-	for(int i = 0; i < 2048; i++) {
+	for (int i = 0; i < 2048; i++) {
 		queue_hit[i] = skip;
 	}
 	/* initialize all ports */
@@ -2735,11 +2874,18 @@ main(int argc, char **argv)
 				         "rte_pmd_qdma_set_queue_mode : "
 				         "Passing of STREAMING_MODE "
 				         "failed\n");
+			if (contiguous) {
+				ret = rte_eth_rx_queue_setup(
+				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[x]);
+				if (ret < 0)
+					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
 
-			ret = rte_eth_rx_queue_setup(
-			    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool);
-			if (ret < 0)
-				rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
+			} else {
+				ret = rte_eth_rx_queue_setup(
+				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[0]);
+				if (ret < 0)
+					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
+			}
 		}
 	}
 
@@ -2799,7 +2945,7 @@ main(int argc, char **argv)
 			// send error packet 0xf00dcafc
 			uint32_t magic_value = 0xf00dcafc;
 			// creazione pacchetto latency
-			struct rte_mbuf *pkt = create_latency_packet(pktmbuf_pool, magic_value);
+			struct rte_mbuf *pkt = create_latency_packet(pktmbuf_pool[0], magic_value);
 			// --- Invia pacchetto su porta 0, queue 0 ---
 			uint16_t nb_tx = rte_eth_tx_burst(portid, 0, &pkt, 1);
 			if (nb_tx < 1) {
@@ -2821,6 +2967,7 @@ main(int argc, char **argv)
 			return -1;
 	}
 	print_stats();
+	print_queue_packet_histogram();
 
 	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
 	printf("measured RX Throughput: %.2f\n",
