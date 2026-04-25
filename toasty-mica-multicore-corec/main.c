@@ -75,7 +75,7 @@ static uint16_t active_io_lcores    = 1;
 
 #define MAX_RX_QUEUE_PER_LCORE 2048
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
-#define MAX_RX_QUEUE_PER_PORT 128
+#define MAX_RX_QUEUE_PER_PORT 2048
 static rte_spinlock_t rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
 
 /* Per-port statistics struct */

@@ -2,6 +2,7 @@
  * Copyright(c) 2010-2016 Intel Corporation
  */
 
+#include "ported-mica/table.h"
 #include "rte_pmd_qdma.h"
 #include <arpa/inet.h>
 // #include <cstddef>
@@ -309,7 +310,7 @@ struct five_tuple {
 } __attribute__((packed));
 
 
-#define NUM_KEYS 2000000
+#define NUM_KEYS 10000000
 // static int VALUE_SIZE = 256;
 static int VALUE_SIZE = 1400;
 size_t     default_keys[NUM_KEYS];
@@ -341,7 +342,9 @@ mica_process5tuple(uint8_t *pkt)
     key.dst_port = udp->dst_port;
     key.proto    = ip->next_proto_id;
 
-    int do_get = (rand() % 100) < get_ratio;
+    // int do_get = (rand() % 100) < get_ratio;
+	int do_get = flag;
+	flag   = !flag;
 
     uint64_t key_hash =
         hash((const uint8_t *)&key, sizeof(key));
@@ -404,67 +407,6 @@ mica_process5tuple(uint8_t *pkt)
     return 0;
 }
 
-static int
-mica_process(uint8_t *payload)
-{
-	size_t key;
-	char   value[VALUE_SIZE];
-
-	// get key
-	memcpy(&key, payload, sizeof(size_t));
-	// flag       = !flag;
-	key        = default_keys[keys_index];
-	keys_index = (keys_index + 1) % NUM_KEYS;
-	int do_get = (rand() % 100) < get_ratio;
-
-
-	// GET
-	// if (flag) {
-	if (do_get) {
-		// printf("get\n");
-		uint64_t key_hash     = hash((const uint8_t *)&key, sizeof(key));
-		// printf("%lu\n", key_hash);
-		//stampare key_hash ogni coda stesse chiavi
-		size_t   value_length = sizeof(value);
-
-		if (mehcached_get(0,
-		                  table,
-		                  key_hash,
-		                  (const uint8_t *)&key,
-		                  sizeof(key),
-		                  (uint8_t *)&value,
-		                  &value_length,
-		                  NULL,
-		                  false))
-			assert(value_length == sizeof(value));
-
-		// send value
-		memcpy(payload + sizeof(size_t), &value, VALUE_SIZE);
-		// printf("GET key: %lu, hash: %lu, value: %s\n", key, key_hash, value);
-	}
-
-	// STORE
-	else {
-		// printf("set\n");
-		memcpy(value, payload + sizeof(size_t), VALUE_SIZE);
-		value[VALUE_SIZE - 1] = '\0';
-		uint64_t key_hash     = hash((const uint8_t *)&key, sizeof(key));
-		// printf("SET key: %lu, hash: %lu, value: %s\n", key, key_hash, value);
-		if (!mehcached_set(0,
-		                   table,
-		                   key_hash,
-		                   (const uint8_t *)&key,
-		                   sizeof(key),
-		                   (const uint8_t *)&value,
-		                   sizeof(value),
-		                   0,
-		                   true))
-			assert(false);
-
-		// send acknowledgement
-		memcpy(payload + sizeof(size_t), &value, VALUE_SIZE);
-	}
-}
 
 static int
 mica_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts)
@@ -473,47 +415,6 @@ mica_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts)
 
 		uint8_t *payload;
 		payload = rte_pktmbuf_mtod(pkts_burst[i], uint8_t *);
-		uint16_t eth_type;
-		eth_type = rte_be_to_cpu_16(((struct rte_ether_hdr *)payload)->ether_type);
-
-		uint8_t ip_proto;
-		ip_proto = ((struct rte_ipv4_hdr *)(payload + sizeof(struct rte_ether_hdr)))->next_proto_id;
-		uint32_t ip_src;
-		ip_src = ((struct rte_ipv4_hdr *)(payload + sizeof(struct rte_ether_hdr)))->src_addr;
-		uint32_t ip_dst;
-		ip_dst = ((struct rte_ipv4_hdr *)(payload + sizeof(struct rte_ether_hdr)))->dst_addr;
-		uint16_t port_src;
-		port_src = ((struct rte_udp_hdr *)(payload + sizeof(struct rte_ether_hdr) +
-		                                   sizeof(struct rte_ipv4_hdr)))
-		               ->src_port;
-		uint16_t port_dst;
-		port_dst = ((struct rte_udp_hdr *)(payload + sizeof(struct rte_ether_hdr) +
-		                                   sizeof(struct rte_ipv4_hdr)))
-		               ->dst_port;
-
-		if (check_packet_magic(pkts_burst[i], str_to_u32("STOP123456789")) == 0) {
-			printf("received stop quitting\n");
-			return 1;
-		}
-		// if (check_packet_magic(pkts_burst[i], 0xf00dcafe) == 0) {
-		// 	printf("received latency packet\n");
-		// 	return 2;
-		// }
-
-		//stampa payload
-		// printf("Received packet: eth_type=0x%04x, ip_proto=%u, ip_src=%u, ip_dst=%u, port_src=%u, port_dst=%u\n",
-		//        eth_type, ip_proto, ip_src, ip_dst, port_src, port_dst);
-		// printf("Payload: ");
-		// for (int j = 0; j < 64; j++) {
-		// 	printf("%02x ", payload[sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
-		// 	                       sizeof(struct rte_udp_hdr) + j]);
-		// }
-		// printf("\n");
-
-		
-		// mica_process(payload + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
-		            //  sizeof(struct rte_udp_hdr));
-		    /* costruzione 5-tupla */
 		mica_process5tuple(payload);
 	}
 	return 0;
