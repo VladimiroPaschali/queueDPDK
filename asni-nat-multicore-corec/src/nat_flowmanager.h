@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <rte_ethdev.h>
+#include <rte_spinlock.h>
 #include <stdlib.h>
 #include <string.h> //for memcpy
 #include <stdbool.h>

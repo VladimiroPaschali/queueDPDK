@@ -106,6 +106,9 @@ int nf_process(uint16_t device, uint16_t rx_queue_id, uint8_t *payload, uint16_t
         return EXPLICIT_DROP;
     }
     struct FlowManager *flow_manager = nat_shard->manager;
+    if (flow_manager == NULL) {
+        return EXPLICIT_DROP;
+    }
 
     //flow_manager_expire(flow_manager, now);
 
