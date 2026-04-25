@@ -36,7 +36,7 @@ struct nf_config;
 // int nf_process(uint16_t device, uint8_t *buffer, uint16_t packet_length,vigor_time_t now);
 // #endif
 
-bool nf_init(void);
+bool nf_init(uint16_t queue_count);
 extern struct nf_config config;
 void nf_config_init(int argc, char **argv);
 void nf_config_usage(void);

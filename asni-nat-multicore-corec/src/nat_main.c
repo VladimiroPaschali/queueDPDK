@@ -2,27 +2,29 @@
 #include <stdio.h>
 #include <limits.h>
 #include <arpa/inet.h>
-#include <rte_lcore.h>
 
 struct nf_config config;
 
-struct nat_shard {
+#define MAX_NAT_RX_QUEUE_SHARDS 2048 /* Keep aligned with MAX_RX_QUEUE_PER_PORT in main.c */
+
+struct nat_queue_shard {
     struct FlowManager *manager;
 };
 
-static struct nat_shard nat_shards[RTE_MAX_LCORE];
+static struct nat_queue_shard nat_queue_shards[MAX_NAT_RX_QUEUE_SHARDS];
+static uint16_t nat_queue_count;
 
-static inline struct nat_shard *get_nat_shard_for_lcore(unsigned lcore_id) {
-    if (lcore_id >= RTE_MAX_LCORE) {
+static inline struct nat_queue_shard *get_nat_shard_for_queue(uint16_t queue_id) {
+    if (queue_id >= nat_queue_count) {
         return NULL;
     }
-    if (nat_shards[lcore_id].manager == NULL) {
+    if (nat_queue_shards[queue_id].manager == NULL) {
         return NULL;
     }
-    return &nat_shards[lcore_id];
+    return &nat_queue_shards[queue_id];
 }
 
-bool nf_init(void) {
+bool nf_init(uint16_t queue_count) {
 
     // Setups the configuration
     config.start_port = 1024;
@@ -59,20 +61,20 @@ bool nf_init(void) {
         return false;
     }
 
-    const unsigned nb_lcores = rte_lcore_count();
-    if (nb_lcores == 0 || nb_lcores > config.max_flows) {
+    if (queue_count == 0 || queue_count > MAX_NAT_RX_QUEUE_SHARDS ||
+        queue_count > config.max_flows) {
         return false;
     }
 
-    memset(nat_shards, 0, sizeof(nat_shards));
+    nat_queue_count = queue_count;
+    memset(nat_queue_shards, 0, sizeof(nat_queue_shards));
 
-    const uint32_t base_flows = config.max_flows / nb_lcores;
-    const uint32_t remainder = config.max_flows % nb_lcores;
+    const uint32_t base_flows = config.max_flows / nat_queue_count;
+    const uint32_t remainder = config.max_flows % nat_queue_count;
     uint32_t shard_start = config.start_port;
-    unsigned shard_index = 0;
-    unsigned lcore_id;
+    uint16_t shard_index;
 
-    RTE_LCORE_FOREACH(lcore_id) {
+    for (shard_index = 0; shard_index < nat_queue_count; shard_index++) {
         const uint32_t shard_flows = base_flows + (shard_index < remainder ? 1U : 0U);
         struct FlowManager *manager = flow_manager_allocate(
             (uint16_t)shard_start, config.external_addr, config.wan_device,
@@ -80,10 +82,9 @@ bool nf_init(void) {
         if (manager == NULL) {
             return false;
         }
-        nat_shards[lcore_id].manager = manager;
+        nat_queue_shards[shard_index].manager = manager;
 
         shard_start += shard_flows;
-        shard_index++;
     }
 
     return true;
@@ -97,11 +98,10 @@ void uint32_to_ipv4(uint32_t ip, char *buffer) {
         perror("inet_ntop");
     }
 }
-int nf_process(uint16_t device, uint8_t *payload, uint16_t ether_type,
+int nf_process(uint16_t device, uint16_t rx_queue_id, uint8_t *payload, uint16_t ether_type,
                uint8_t ip_proto, uint32_t ip_src, uint32_t ip_dst,
                uint16_t port_src, uint16_t port_dst, vigor_time_t now) {
-    const unsigned lcore_id = rte_lcore_id();
-    struct nat_shard *nat_shard = get_nat_shard_for_lcore(lcore_id);
+    struct nat_queue_shard *nat_shard = get_nat_shard_for_queue(rx_queue_id);
     if (nat_shard == NULL) {
         return EXPLICIT_DROP;
     }

@@ -15,6 +15,7 @@
 #define EXPLICIT_DROP (1 << 16) - 1
 
 int nf_process(uint16_t device, 
+                uint16_t rx_queue_id,
                 uint8_t *payload,
                 uint16_t ether_type,
                 uint8_t ip_proto,

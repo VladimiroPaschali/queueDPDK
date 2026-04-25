@@ -72,7 +72,7 @@ struct countmin {
 	uint64_t **values;
 };
 
-struct countmin     *cm;
+struct countmin     *cm_per_core[RTE_MAX_LCORE];
 static volatile bool force_quit;
 
 /*
@@ -1504,6 +1504,8 @@ count_add(struct rte_mbuf *m)
 	// }
 
 	// --- calcolo hash sui campi della 5-tuple ---
+	unsigned lcore_id = rte_lcore_id();
+	struct countmin *cm = cm_per_core[lcore_id];
 	for (int i = 0; i < HASHFN_N; i++) {
 		uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
 		uint32_t target_idx = h & (COLUMNS - 1);
@@ -2700,16 +2702,18 @@ main(int argc, char **argv)
 		}
 	}
 
-	// start
-	cm         = rte_zmalloc(NULL, sizeof(struct countmin), 64);
-	cm->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
-	for (int i = 0; i < HASHFN_N; i++) {
-		cm->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * COLUMNS, 64);
-	}
+	// start - allocate CMS per core
+	for (unsigned lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+		cm_per_core[lcore_id] = rte_zmalloc(NULL, sizeof(struct countmin), 64);
+		cm_per_core[lcore_id]->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
+		for (int i = 0; i < HASHFN_N; i++) {
+			cm_per_core[lcore_id]->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * COLUMNS, 64);
+		}
 
-	for (int i = 0; i < HASHFN_N; i++) {
-		for (int j = 0; j < COLUMNS; j++) {
-			cm->values[i][j] = 0;
+		for (int i = 0; i < HASHFN_N; i++) {
+			for (int j = 0; j < COLUMNS; j++) {
+				cm_per_core[lcore_id]->values[i][j] = 0;
+			}
 		}
 	}
 	check_all_ports_link_status(enabled_port_mask);
@@ -2748,12 +2752,14 @@ main(int argc, char **argv)
 	print_stats();
 	// print_queue_packet_histogram();
 
-	// free countmin
-	for (int i = 0; i < HASHFN_N; i++) {
-		rte_free(cm->values[i]);
+	// free countmin per core
+	for (unsigned lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+		for (int i = 0; i < HASHFN_N; i++) {
+			rte_free(cm_per_core[lcore_id]->values[i]);
+		}
+		rte_free(cm_per_core[lcore_id]->values);
+		rte_free(cm_per_core[lcore_id]);
 	}
-	rte_free(cm->values);
-	rte_free(cm);
 
 	return 0;
 }
