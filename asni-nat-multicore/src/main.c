@@ -2703,7 +2703,7 @@ main(int argc, char **argv)
 	}
 
 	// start - allocate CMS per core
-	for (unsigned lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+	RTE_LCORE_FOREACH(lcore_id) {
 		cm_per_core[lcore_id] = rte_zmalloc(NULL, sizeof(struct countmin), 64);
 		cm_per_core[lcore_id]->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
 		for (int i = 0; i < HASHFN_N; i++) {
@@ -2753,7 +2753,7 @@ main(int argc, char **argv)
 	// print_queue_packet_histogram();
 
 	// free countmin per core
-	for (unsigned lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+	RTE_LCORE_FOREACH(lcore_id) {
 		for (int i = 0; i < HASHFN_N; i++) {
 			rte_free(cm_per_core[lcore_id]->values[i]);
 		}
