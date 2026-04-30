@@ -1749,9 +1749,7 @@ main_loop(__rte_unused void *dummy)
 				queue_hit_local[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
-				if (i > queue_start) {
-					i--;
-				}
+				i--;
 				max_loops--;
 			} else {
 				max_loops = 100;
