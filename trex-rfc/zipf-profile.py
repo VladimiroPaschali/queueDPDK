@@ -17,6 +17,9 @@ class ZipfProfile(object):
         
     def _generate_flow_weights(self):
         """Calcola i pesi Zipf per ogni flusso"""
+        if self.skew == 0:
+            probs = 1.0 / self.num_flows
+            return probs * np.ones(self.num_flows)
         if self.skew < 1.0:
             ranks = np.arange(1, self.num_flows + 1)
             weights = 1.0 / np.power(ranks, self.skew)

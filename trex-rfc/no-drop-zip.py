@@ -59,6 +59,43 @@ def _get_dpdk_throughput(dpdk_output) -> int:
     
     return rx_packets
 
+def _get_empty_poll(dpdk_output) -> int:
+    matches = re.findall(
+        r'empty/sec\s*\(the poll read no packets\)\s*:\s*(\d+)',
+        # r'empty/burst.*?:\s*([\d.]+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        last_10 = [float(m) for m in matches[-10:]]
+        empty_poll = sum(last_10) / len(last_10)
+        # print("Empty poll (ultimi 10):", last_10)
+        # print("Empty poll (media):", empty_poll)
+    else:
+        empty_poll = -1
+        print("Empty poll not found")
+
+    return empty_poll
+
+def _get_packet_per_burst(dpdk_output) -> int:
+    matches = re.findall(
+        # r'packets/burst:\s*(\d+)',
+        r'pkts/burst.*?:\s*([\d.]+)',
+        dpdk_output,
+        re.IGNORECASE
+    )
+
+    if matches:
+        last_10 = [float(m) for m in matches[-10:]]
+        packet_per_burst = sum(last_10) / len(last_10)
+        print("Packets per burst (ultimi 10):", last_10)
+        print("Packets per burst (media):", packet_per_burst)
+    else:
+        packet_per_burst = -1
+        print("Packets per burst not found")    
+    return packet_per_burst
+
 def _get_all_pkts(dpdk_output) -> int:
 
     match = re.search(r'measured RX packets:\s*(\d+)', dpdk_output)
@@ -96,6 +133,8 @@ def launch_program_with_perf(base_command, queue, policy, perf_events, final_pps
     perf_data = _parse_perf_output(result.stderr)
     all_pkts = _get_all_pkts(result.stdout)
     throughput = _get_dpdk_throughput(result.stdout)
+    empty = _get_empty_poll(result.stdout)
+    packet_per_burst = _get_packet_per_burst(result.stdout)
 
     if all_pkts <= 0:
         tqdm.write("⚠️ All packets count normalizing with last trex throughput.")
@@ -103,7 +142,7 @@ def launch_program_with_perf(base_command, queue, policy, perf_events, final_pps
     else:
         perf_data = {k: v / all_pkts for k, v in perf_data.items()}
 
-    return perf_data
+    return perf_data, empty, packet_per_burst
 
 
 
@@ -181,7 +220,7 @@ def extract_final_pps(bench, policy, queue, repetition):
         return None
 
 
-def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_events, csv_file="benchmark_results.csv"):
+def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_events, empty_poll=None, packet_per_burst=None, csv_file="benchmark_results.csv"):
     """Esporta i risultati di una iterazione (con metriche perf) in CSV strutturato"""
     try:
         results_json = bench.results.to_json()
@@ -216,6 +255,8 @@ def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_e
             'cpu_util': results_data.get('cpu_util', ''),
             'bw_per_core': results_data.get('bw_per_core', ''),
             'elapsed_time': results_data.get('Elapsed Time', ''),
+            'empty_poll': empty_poll if empty_poll is not None else '',
+            'packet_per_burst': packet_per_burst if packet_per_burst is not None else '',
         }
         
         # Aggiungi metriche perf dinamicamente
@@ -357,136 +398,155 @@ def clear_csv_files():
             os.remove(csv_file)
             tqdm.write(f"🔄 CSV precedente rimosso ({csv_file})")
 
+def set_governor(governor):
+    for core in range(9):
+        path = f"/sys/devices/system/cpu/cpu{core}/cpufreq/scaling_governor"
+        try:
+            sp.run(
+                ["sudo", "tee", path],
+                input=governor,
+                text=True,
+                stdout=sp.DEVNULL,
+                check=True
+            )
+            print(f"Core {core}: {governor} OK")
+        except sp.CalledProcessError:
+            print(f"Core {core}: errore")
+
 def main():
     client = STLClient(server="10.181.120.102")
 
     # Definisci i comandi e le loro configurazioni
     commands_config = {
-        'chain1024d': {
-            'policies': ["-a -s 5"],
-            'repetitions': 10,
-            'queues': [1, 2, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
+        'chain': {
+            # 'policies': ["","-a","-s 5", "-a -s 5"],
+            'policies': [""],
+            'repetitions': 1,
+            'queues': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+            # 'queues': [1, 512],
+            'zipf_skews': [0.6,0.9],
             'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
-            'additional_args': '-d 1024'
         },
-        'chain2048d': {
-            'policies': ["-a -s 5"],
-            'repetitions': 10,
-            'queues': [1, 2, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
-            'additional_args': '-d 2048'
-        },
-        'chain4096d': {
-            'policies': ["-a -s 5"],
-            'repetitions': 10,
-            'queues': [1, 2, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
-            'additional_args': '-d 4096'
-        },
-        'chain8192d': {
-            'policies': ["-a -s 5"],
-            'repetitions': 10,
-            'queues': [1, 2, 64, 256, 512],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
-            'additional_args': '-d 8192'
-        },
+        # 'chain2048d': {
+        #     'policies': ["-a -s 5"],
+        #     'repetitions': 10,
+        #     'queues': [1, 2, 64, 256, 512, 1024],
+        #     'zipf_skews': [0.6],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
+        #     'additional_args': '-d 2048'
+        # },
+        # 'chain4096d': {
+        #     'policies': ["-a -s 5"],
+        #     'repetitions': 10,
+        #     'queues': [1, 2, 64, 256, 512, 1024],
+        #     'zipf_skews': [0.6],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
+        #     'additional_args': '-d 4096'
+        # },
+        # '2chain8192d': {
+        #     'policies': ["-a -s 5"],
+        #     'repetitions': 10,
+        #     # 'queues': [1, 2, 64, 256, 512],
+        #     'queues': [1, 512],
+        #     'zipf_skews': [0.6],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db',
+        #     'additional_args': '-d 8192'
+        # },
         # 'marco_chain': {
         #     'policies': ["", "-a"],
         #     'base_command': 'sudo /home/vladimiro/dpdk_patched/marco/dpdk-20.11/queueDPDK/asni-nat/build/asni-nat -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1,indirect_queues=1024 -- -p 0x3 --config="(0,0,4)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-        # },
-        # 'mica': {
-        #     'policies': ["", "-a", "-a -s 5"],
-        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica/build/toasty-mica -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- '
         # },
         # 'marco_mica': {
         #     'policies': ["", "-a"],
         #     'base_command': 'sudo /home/vladimiro/dpdk_patched/marco/dpdk-20.11/queueDPDK/toasty-mica/build/toasty-mica -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1,indirect_queues=1024 -- '
         # },
-        # 'mica': {
-        #     'policies': [ "-a -s"],
-        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica/build/toasty-mica -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- '
-        # },
+        'mica': {
+            'policies': [ "", "-a", "-s 5", "-a -s 5" ],
+            'repetitions': 1,
+            # 'queues': [1, 512],
+            'queues': [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+            'zipf_skews': [0, 0.9],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica/build/toasty-mica -d librte_net_qdma.so -l 4 -n 4 -a 0000:16:00.1 -- '
+        },
         'chain-multicore2': {
             'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [2, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
+            'repetitions': 1,
+            'queues': [2, 4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+            'zipf_skews': [0.6, 0.9],
             'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore/build/asni-nat -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-
         },
         'chain-multicore4': {
             'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [4, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
+            'repetitions': 1,
+            'queues': [4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+            'zipf_skews': [0.6, 0.9],
             'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore/build/asni-nat -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-
         },
         'chain-multicore8': {
             'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [4, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
+            'repetitions': 1,
+            'queues': [8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+            'zipf_skews': [0.6, 0.9],
             'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore/build/asni-nat -d librte_net_qdma.so -l 0-7 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
         },
-        'chain-multicore-corec2': {
-            'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [2, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore-corec/build/asni-nat -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-        },
-        'chain-multicore-corec4': {
-            'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [4, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore-corec/build/asni-nat -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-        },
-        'chain-multicore-corec8': {
-            'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [4, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore-corec/build/asni-nat -d librte_net_qdma.so -l 0-7 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
-        },
-
-        # 
-        # 'mica-multicore2': {
+        # 'chain-multicore-corec2': {
         #     'policies': ["-a -s 5"],
-        #     'repetitions': 3,
-        #     'queues': [2, 64, 256, 512, 1024],
-        #     'zipf_skews': [0.6],
-        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore/build/toasty-mica -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- '
+        #     'repetitions': 1,
+        #     'queues': [2, 4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+        #     'zipf_skews': [0.6, 0.9],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore-corec/build/asni-nat -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
+        # },
+        # 'chain-multicore-corec4': {
+        #     'policies': ["-a -s 5"],
+        #     'repetitions': 1,
+        #     'queues': [4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+        #     'zipf_skews': [0.6, 0.9],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore-corec/build/asni-nat -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
+        # },
+        # 'chain-multicore-corec8': {
+        #     'policies': ["-a -s 5"],
+        #     'repetitions': 1,
+        #     'queues': [8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+        #     'zipf_skews': [0.6, 0.9],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/asni-nat-multicore-corec/build/asni-nat -d librte_net_qdma.so -l 0-7 -n 4 -a 0000:16:00.1 -- -p 0x3 --config="(0,0,0),(0,1,1)" --rule_ipv4=../chain/fw_10k --rule_ipv6=../chain/rule_ipv6.db'
+        # },
+        'mica-multicore2': {
+            'policies': ["-a -s 5"],
+            'repetitions': 1,
+            'queues': [2, 4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+            'zipf_skews': [0, 0.9],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore/build/toasty-mica -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- '
+
+        },
+        'mica-multicore4': {
+            'policies': ["-a -s 5"],
+            'repetitions': 1,
+            'queues': [4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+            'zipf_skews': [0, 0.9],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore/build/toasty-mica -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- '
+        },
+        'mica-multicore8': {
+            'policies': ["-a -s 5"],
+            'repetitions': 1,
+            'queues': [8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+            'zipf_skews': [0, 0.9],
+            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore/build/toasty-mica -d librte_net_qdma.so -l 0-7 -n 4 -a 0000:16:00.1 -- '
+        },
+        # 'mica-multicore-corec2': {
+        #     'policies': ["-a -s 5"],
+        #     'repetitions': 1,
+        #     'queues': [2, 4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+        #     'zipf_skews': [0.6, 0.9],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore-corec/build/toasty-mica -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- '
 
         # },
-        # 'mica-multicore4': {
+        # 'mica-multicore-corec4': {
         #     'policies': ["-a -s 5"],
-        #     'repetitions': 3,
-        #     'queues': [4, 64, 256, 512, 1024],
-        #     'zipf_skews': [0.6],
-        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore/build/toasty-mica -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- '
-
+        #     'repetitions': 1,
+        #     'queues': [4, 8, 16, 32, 64, 128, 256, 512 ,1024, 2048],
+        #     'zipf_skews': [0.6, 0.9],
+        #     'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore-corec/build/toasty-mica -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- '
         # },
-        'mica-multicore-corec2': {
-            'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [2, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore-corec/build/toasty-mica -d librte_net_qdma.so -l 0,1 -n 4 -a 0000:16:00.1 -- '
-
-        },
-        'mica-multicore-corec4': {
-            'policies': ["-a -s 5"],
-            'repetitions': 3,
-            'queues': [4, 64, 256, 512, 1024],
-            'zipf_skews': [0.6],
-            'base_command': 'sudo /home/vladimiro/dpdk_patched/queueDPDK/toasty-mica-multicore-corec/build/toasty-mica -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- '
-        },
 
     }
     
@@ -504,6 +564,7 @@ def main():
         tqdm.write("Connessione a TRex...")
         client.connect()
 
+        set_governor("performance")
         
         # Calcola il numero totale di iterazioni
         total_iterations = sum(
@@ -562,15 +623,15 @@ def main():
                 config = NdrBenchConfig(
                     ports=PORTS,
                     cores=1,
-                    iteration_duration=10.0,
-                    first_run_duration=10.0,
+                    iteration_duration=20.0,
+                    first_run_duration=20.0,
                     max_iterations=100,
-                    pdr=0.1,          
-                    pdr_error=1.0,
+                    pdr=0.1, #0.2 0.09 
+                    pdr_error=0.1, 
                     bi_dir=False,
                     verbose=False,
                     opt_binary_search=True,
-                    opt_binary_search_percentage=0.5,
+                    opt_binary_search_percentage=0.1,
                     plugin_file="ndr_plugin_stats.py",
                 )
                 config.receive_ports = [0]
@@ -594,10 +655,10 @@ def main():
                             if final_pps:
                                 # Esegui perf per ottenere le metriche
                                 launch_trex(client, final_pps)
-                                perf_metrics = launch_program_with_perf(base_command, queue, policy, perf_events, final_pps)
+                                perf_metrics, empty_poll, packet_per_burst = launch_program_with_perf(base_command, queue, policy, perf_events, final_pps)
                                 stop_trex(client)
                                 # Esporta risultati benchmark + metriche perf in CSV
-                                export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events, csv_file)
+                                export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events, empty_poll, packet_per_burst, csv_file)
             
                             pbar.update(1)
                         # Calcola e salva la media per questo gruppo di ripetizioni
@@ -609,6 +670,7 @@ def main():
         pbar.close()
     
     finally:
+        set_governor("schedutil")
         tqdm.write("\nDisconnessione...")
         client.disconnect()
 
