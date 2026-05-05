@@ -68,7 +68,7 @@ def _get_empty_poll(dpdk_output) -> int:
     )
 
     if matches:
-        last_10 = [float(m) for m in matches[-10:]]
+        last_10 = [float(m) for m in matches[-10:-2]]
         empty_poll = sum(last_10) / len(last_10)
         # print("Empty poll (ultimi 10):", last_10)
         # print("Empty poll (media):", empty_poll)
@@ -87,7 +87,7 @@ def _get_packet_per_burst(dpdk_output) -> int:
     )
 
     if matches:
-        last_10 = [float(m) for m in matches[-10:]]
+        last_10 = [float(m) for m in matches[-10:-2]]
         packet_per_burst = sum(last_10) / len(last_10)
         print("Packets per burst (ultimi 10):", last_10)
         print("Packets per burst (media):", packet_per_burst)
@@ -133,8 +133,6 @@ def launch_program_with_perf(base_command, queue, policy, perf_events, final_pps
     perf_data = _parse_perf_output(result.stderr)
     all_pkts = _get_all_pkts(result.stdout)
     throughput = _get_dpdk_throughput(result.stdout)
-    empty = _get_empty_poll(result.stdout)
-    packet_per_burst = _get_packet_per_burst(result.stdout)
 
     if all_pkts <= 0:
         tqdm.write("⚠️ All packets count normalizing with last trex throughput.")
@@ -142,7 +140,7 @@ def launch_program_with_perf(base_command, queue, policy, perf_events, final_pps
     else:
         perf_data = {k: v / all_pkts for k, v in perf_data.items()}
 
-    return perf_data, empty, packet_per_burst
+    return perf_data
 
 
 
@@ -163,10 +161,12 @@ def launch_program(base_command, queue, policy, additional_args):
         
         # Flag per sincronizzazione
         process._ready_event = threading.Event()
+        process._output = ""
         
         # Thread per leggere output silenziosamente
         def read_output():
             for line in process.stdout:
+                process._output += line
                 if "ready" in line.lower() or "entering main loop" in line.lower():
                     process._ready_event.set()
         
@@ -186,10 +186,16 @@ def launch_program(base_command, queue, policy, additional_args):
         return -1
 
 def stop_program(process):
-    if process:
+    if process and process != -1:
         process.terminate()   # tenta chiusura "soft"
-        process.wait()        
+        process.wait()
+        
+        empty_poll = _get_empty_poll(process._output)
+        packet_per_burst = _get_packet_per_burst(process._output)
+        
         tqdm.write("Program terminated.")
+        return empty_poll, packet_per_burst
+    return None, None
 
 
 def extract_final_pps(bench, policy, queue, repetition):
@@ -647,7 +653,7 @@ def main():
                             bench = NdrBench(client, config)
                             process = launch_program(base_command, queue, policy, additional_args)
                             bench.find_ndr()
-                            stop_program(process)
+                            empty_poll, packet_per_burst = stop_program(process)
                             
                             # Estrai final_pps dai risultati del benchmark
                             final_pps = extract_final_pps(bench, policy, queue, repetition+1)
@@ -655,7 +661,7 @@ def main():
                             if final_pps:
                                 # Esegui perf per ottenere le metriche
                                 launch_trex(client, final_pps)
-                                perf_metrics, empty_poll, packet_per_burst = launch_program_with_perf(base_command, queue, policy, perf_events, final_pps)
+                                perf_metrics = launch_program_with_perf(base_command, queue, policy, perf_events, final_pps)
                                 stop_trex(client)
                                 # Esporta risultati benchmark + metriche perf in CSV
                                 export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events, empty_poll, packet_per_burst, csv_file)
