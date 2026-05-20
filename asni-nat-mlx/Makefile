@@ -44,19 +44,19 @@ build/$(APP)-static: $(SRCS-y) Makefile $(PC_FILE) | build
 
 
 # Local build using DPDK-20.11 source tree
-DPDK_LOCAL_PATH ?= ../../dpdk-20.11
+DPDK_LOCAL_PATH ?= ../../dpdk-20.11-original
 DPDK_BUILD ?= $(DPDK_LOCAL_PATH)/build
 
-DPDK_INCLUDES := -I$(DPDK_LOCAL_PATH) -I$(DPDK_BUILD)/include
+DPDK_INCLUDES := -I$(DPDK_LOCAL_PATH)/config -I$(DPDK_LOCAL_PATH) -I$(DPDK_BUILD)/include
 DPDK_LIBS := $(wildcard $(DPDK_BUILD)/lib/librte_*.a)
 # Exclude some drivers that are not needed for this application and may cause issues with the build process.
-EXCLUDED_DRIVERS := librte_net_mlx4.a librte_common_mlx5.a librte_vdpa_mlx5.a librte_regex_mlx5.a librte_net_mlx5.a
+EXCLUDED_DRIVERS := librte_net_mlx4.a
 DPDK_DRIVERS := $(filter-out $(addprefix $(DPDK_BUILD)/drivers/, $(EXCLUDED_DRIVERS)), $(wildcard $(DPDK_BUILD)/drivers/librte_*.a))
 
 CFLAGS_LOCAL += $(DPDK_INCLUDES) -DALLOW_EXPERIMENTAL_API -O3 -march=native
 LDFLAGS_LOCAL = -Wl,--as-needed -Wl,--no-undefined -Wl,-O1 \
 	-Wl,--whole-archive $(DPDK_LIBS) $(DPDK_DRIVERS) -Wl,--no-whole-archive \
-	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs
+	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs -lmlx5 -ljansson
 
 
 build/$(APP)-local: $(SRCS-y) Makefile | build

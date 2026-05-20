@@ -2,7 +2,6 @@
  * Copyright(c) 2010-2016 Intel Corporation
  */
 
-#include "rte_pmd_qdma.h"
 #include "nat_flowmanager.h"
 #include "utils/vigor-time.h"
 #include "nat_main.h"
@@ -121,7 +120,7 @@ uint64_t        measured_packets_rx = 0;
 
 /* mask of enabled ports */
 static uint32_t enabled_port_mask;
-static int      promiscuous_on;        /**< Ports set in promiscuous mode off by default. */
+static int      promiscuous_on = 1;    /**< Ports set in promiscuous mode on by default. */
 static int      numa_on       = 1;     /**< NUMA is enabled by default. */
 bool            after_warmup  = false; /* reset statistics after warmup time */
 uint64_t        measured_tick = 0;
@@ -708,18 +707,14 @@ prepare_one_packet(struct rte_mbuf **pkts_in, struct acl_search_t *acl, int inde
 			acl->m_ipv4[(acl->num_ipv4)++] = pkt;
 
 		} else {
-			/* Not a valid IPv4 packet */
-			rte_pktmbuf_free(pkt);
+			/* Invalid IPv4: skip ACL but keep mbuf alive for TX */
 		}
 	} else if (RTE_ETH_IS_IPV6_HDR(pkt->packet_type)) {
 		/* Fill acl structure */
 		acl->data_ipv6[acl->num_ipv6]  = MBUF_IPV6_2PROTO(pkt);
 		acl->m_ipv6[(acl->num_ipv6)++] = pkt;
 
-	} else {
-		/* Unknown type, drop the packet */
-		rte_pktmbuf_free(pkt);
-	}
+	} /* else: unknown type — keep mbuf alive for TX, skip ACL */
 }
 
 #else
@@ -737,10 +732,7 @@ prepare_one_packet(struct rte_mbuf **pkts_in, struct acl_search_t *acl, int inde
 		/* Fill acl structure */
 		acl->data_ipv6[acl->num_ipv6]  = MBUF_IPV6_2PROTO(pkt);
 		acl->m_ipv6[(acl->num_ipv6)++] = pkt;
-	} else {
-		/* Unknown type, drop the packet */
-		rte_pktmbuf_free(pkt);
-	}
+	} /* else: keep mbuf alive for TX */
 }
 #endif /* DO_RFC_1812_CHECKS */
 
@@ -1875,10 +1867,8 @@ main_loop(__rte_unused void *dummy)
 			n_pkts += nb_rx;
 
 			if (nb_rx > 0) {
-				// printf("queueid=%hhu\n", queueid);
 				struct acl_search_t acl_search;
 
-				// // qui prefetcha
 				prepare_acl_parameter(pkts_burst, &acl_search, nb_rx);
 
 				ret = nf_process_burst(pkts_burst, nb_rx, portid);
@@ -1887,9 +1877,6 @@ main_loop(__rte_unused void *dummy)
 					end_time = cur_tsc - end_warmup;
 					return 0; // received stop signal
 				}
-				// else if (ret == 2) {
-				// 	printf("latency packet received on queue %d\n", i);
-				// }
 
 				if (acl_search.num_ipv4) {
 					rte_acl_classify(acl_config.acx_ipv4[socketid],
@@ -1897,10 +1884,6 @@ main_loop(__rte_unused void *dummy)
 					                 acl_search.res_ipv4,
 					                 acl_search.num_ipv4,
 					                 DEFAULT_MAX_CATEGORIES);
-
-					// send_packets(acl_search.m_ipv4, acl_search.res_ipv4, acl_search.num_ipv4);
-					// send_packets_always(
-					//     acl_search.m_ipv4, acl_search.res_ipv4, acl_search.num_ipv4, portid);
 				}
 
 				if (acl_search.num_ipv6) {
@@ -1909,13 +1892,17 @@ main_loop(__rte_unused void *dummy)
 					                 acl_search.res_ipv6,
 					                 acl_search.num_ipv6,
 					                 DEFAULT_MAX_CATEGORIES);
-
-					// send_packets(acl_search.m_ipv6, acl_search.res_ipv6, acl_search.num_ipv6);
-					// send_packets_always(
-					//     acl_search.m_ipv6, acl_search.res_ipv6, acl_search.num_ipv6, portid);
 				}
-				// send_packets_always(pkts_burst, NULL, nb_rx, portid);
-				uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+
+				/* TX ALL pkts_burst (no drop policy). */
+				{
+					uint16_t nb_tx = rte_eth_tx_burst(portid, 0,
+					                                  pkts_burst, (uint16_t)nb_rx);
+					for (int k = nb_tx; k < nb_rx; k++)
+						rte_pktmbuf_free(pkts_burst[k]);
+				}
+
+
 
 				port_statistics[portid][i].rx += nb_rx;
 				if (after_warmup) {
@@ -2738,45 +2725,18 @@ main(int argc, char **argv)
 			         portid,
 			         strerror(-ret));
 
-		struct rte_eth_dev *dev = &rte_eth_devices[portid];
+		local_port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
+		if (local_port_conf.rx_adv_conf.rss_conf.rss_hf != port_conf.rx_adv_conf.rss_conf.rss_hf)
+			printf("Port %u: RSS hash functions adjusted, "
+			       "requested: 0x%" PRIx64 " configured: 0x%" PRIx64 "\n",
+			       portid,
+			       port_conf.rx_adv_conf.rss_conf.rss_hf,
+			       local_port_conf.rx_adv_conf.rss_conf.rss_hf);
+
 		ret = rte_eth_dev_configure(portid, (uint16_t)queues, (uint16_t)1, &local_port_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%d\n", ret, portid);
 
-		// struct qdma_pci_dev *qdma_dev = dev->data->dev_private;
-		uint32_t reg_offst = 0; // timestamp;
-		uint32_t val       = qdma_reg_read_usr(dev, reg_offst);
-		// Timestamp--> QDMA Reg (0x0) Value: 0x0940907F
-		printf("Timestamp--> QDMA Reg (0x%X) Value: 0x%X\n", reg_offst, val);
-		if (val != 0x940907F) {
-			printf("wrong bitstream\n");
-			return 0;
-		}
-
-		struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
-		int                             i, j;
-		// crea l'indir table con valori da 0 a cms_rx_queue_per_lcore
-		for (i = 0; i < dev_info.reta_size / RTE_RETA_GROUP_SIZE; i++) {
-			// select all fields to set //
-			reta_conf[i].mask = ~0LL;
-			for (j = 0; j < RTE_RETA_GROUP_SIZE; j++)
-				// da 0 a number of queues
-				reta_conf[i].reta[j] = 0;
-		}
-		// salva l'indir table sul device
-		ret = rte_eth_dev_rss_reta_update(portid, reta_conf, dev_info.reta_size);
-		if (ret < 0)
-			// stampa errore
-			rte_exit(EXIT_FAILURE, "Cannot set RSS REA: err=%d, port=%u\n", ret, portid);
-
-		rte_eth_dev_rss_reta_query(portid, reta_conf, dev_info.reta_size);
-		printf("pre-queues %u\n", queues);
-		printf("reta-queues %u\n", reta_conf[0].reta[0] + 1);
-		if (queues != reta_conf[0].reta[0] + 1)
-			rte_exit(EXIT_FAILURE,
-			         "Cannot get correct number of queues: %d != %d\n",
-			         queues,
-			         reta_conf[0].reta[0] + 1);
 		printf("cms_rx_queue_per_lcore: %d\n", queues);
 
 		rte_eth_dev_info_get(portid, &dev_info);
@@ -2850,40 +2810,21 @@ main(int argc, char **argv)
 		}
 		printf("\n");
 
-		int      diag, x;
-		uint32_t queue_base;
-		diag = rte_pmd_qdma_get_queue_base(portid, &queue_base);
-		if (diag < 0)
-			rte_exit(EXIT_FAILURE,
-			         "rte_pmd_qdma_get_queue_base : Querying of "
-			         "QUEUE_BASE failed\n");
-		// for loop sulle varie code
-		/* init one RX queue */
+		/* init RX queues */
 		fflush(stdout);
 		struct rte_eth_rxconf rxq_conf;
 
 		rxq_conf          = dev_info.default_rxconf;
 		rxq_conf.offloads = local_port_conf.rxmode.offloads;
 
-		for (x = 0; x < queues; x++) {
-			diag = rte_pmd_qdma_set_queue_mode(portid, x, RTE_PMD_QDMA_STREAMING_MODE);
-			if (diag < 0)
+		for (int x = 0; x < queues; x++) {
+			ret = rte_eth_rx_queue_setup(portid, x, nb_rxd,
+			                             rte_eth_dev_socket_id(portid),
+			                             &rxq_conf, pktmbuf_pool[0]);
+			if (ret < 0)
 				rte_exit(EXIT_FAILURE,
-				         "rte_pmd_qdma_set_queue_mode : "
-				         "Passing of STREAMING_MODE "
-				         "failed\n");
-			if (contiguous) {
-				ret = rte_eth_rx_queue_setup(
-				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[x]);
-				if (ret < 0)
-					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
-
-			} else {
-				ret = rte_eth_rx_queue_setup(
-				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[0]);
-				if (ret < 0)
-					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
-			}
+				         "rte_eth_rx_queue_setup:err=%d, port=%u\n",
+				         ret, portid);
 		}
 	}
 
@@ -2900,12 +2841,6 @@ main(int argc, char **argv)
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_dev_start: err=%d, port=%d\n", ret, portid);
 
-		/*
-		 * If enabled, put device in promiscuous mode.
-		 * This allows IO forwarding mode to forward packets
-		 * to itself through 2 cross-connected  ports of the
-		 * target machine.
-		 */
 		if (promiscuous_on) {
 			ret = rte_eth_promiscuous_enable(portid);
 			if (ret != 0)
@@ -2933,29 +2868,8 @@ main(int argc, char **argv)
 	}
 	check_all_ports_link_status(enabled_port_mask);
 
-	sleep(3);
-	// rfc
-	RTE_ETH_FOREACH_DEV(portid)
-	{
-		int send_packets = rte_log2_u32(queues) + 1;
-		printf("numero di pacchetti %d\n", send_packets);
-		for (int i = 0; i < send_packets; i++) {
-			// send error packet 0xf00dcafc
-			uint32_t magic_value = 0xf00dcafc;
-			// creazione pacchetto latency
-			struct rte_mbuf *pkt = create_latency_packet(pktmbuf_pool[0], magic_value);
-			// --- Invia pacchetto su porta 0, queue 0 ---
-			uint16_t nb_tx = rte_eth_tx_burst(portid, 0, &pkt, 1);
-			if (nb_tx < 1) {
-				printf("Invio fallito, liberando mbuf\n");
-				rte_pktmbuf_free(pkt);
-				rte_exit(EXIT_FAILURE, "Errore Invio pacchetto clear\n");
-
-			} else {
-				printf("Pacchetto inviato con successo\n");
-			}
-		}
-	}
+	/* NOTE: il blocco "clear packets" era specifico per la pipeline FPGA/QDMA;
+	 * non necessario su Mellanox mlx5. */
 
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
