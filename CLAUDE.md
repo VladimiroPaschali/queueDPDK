@@ -27,7 +27,7 @@ Policies are runtime options (see the table at the top of `common/qflow.h`): `--
 
 Each app has a single `poll_loop(const enum qflow_mode mode)` marked `__rte_always_inline`. It is instantiated three times (`main_loop_single`, `main_loop_partitioned`, `main_loop_shared`), so each multicore policy compiles to its own loop. The three modes intentionally keep the internals of the original separate programs, so the paper's numbers stay reproducible. Do not "unify" these differences without re-measuring:
 
-- **Single core.** TX on queue 0 per burst (unsent mbufs are not freed), per-second `print_stats()`, and throughput measured after a 3 s warmup.
+- **Single core.** TX on queue 0 per burst, per-second `print_stats()`, and throughput measured after a 3 s warmup.
 - **Multicore.** TX is batched (`TX_BATCH_SIZE`) on the lcore's own TX queue, with no per-second statistics.
 - **Penalty counters.** Global on a single core, per lcore otherwise. Partitioned indexes them relative to its slice and keeps that index across a latency diversion.
 - **nf-chain CMS.** 16×1M with a row-pointer table on a single core and in Shared, 16×65536 embedded in Partitioned, one sketch per lcore.

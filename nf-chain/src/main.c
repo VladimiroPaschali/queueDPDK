@@ -1960,8 +1960,9 @@ poll_loop(const enum qflow_mode mode)
 				}
 
 				if (mode == QFLOW_SINGLE) {
-					/* mbufs the NIC does not accept are not freed */
-					rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+					uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+					for (int j = nb_tx; j < nb_rx; j++)
+						rte_pktmbuf_free(pkts_burst[j]);
 
 					port_statistics[portid][i].rx += nb_rx;
 					if (after_warmup) {
