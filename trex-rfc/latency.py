@@ -98,12 +98,12 @@ def probe_packet():
     return pkt / Raw(load=b"\x42" * max(0, PACKET_SIZE - len(pkt)))
 
 
-def load_streams(client, skew, flows, probe_ratio):
-    """Zipf load plus the latency probe, with the probe at probe_ratio of the load.
+def load_streams(client, skew, flows, probe_pps):
+    """Zipf load plus the latency probe.
 
-    zipf-profile.py gives every flow a base rate summing to @flows pps; the
-    whole port is then scaled with start(mult=...), which keeps the probe a
-    fixed fraction of the offered rate.
+    zipf-profile.py gives every flow a base rate summing to @flows pps and the
+    port is scaled with start(mult=...). TRex does not apply the multiplier to
+    latency streams, so the probe keeps its absolute rate @probe_pps.
     """
     client.stop(ports=PORTS)
     client.reset(ports=PORTS)
@@ -113,7 +113,7 @@ def load_streams(client, skew, flows, probe_ratio):
     ).get_streams()
     streams.append(STLStream(
         packet=STLPktBuilder(pkt=probe_packet()),
-        mode=STLTXCont(pps=flows * probe_ratio),
+        mode=STLTXCont(pps=probe_pps),
         flow_stats=STLFlowLatencyStats(pg_id=PROBE_PG_ID),
     ))
     client.add_streams(streams, ports=PORTS)
@@ -345,8 +345,7 @@ def main():
     parser.add_argument("--step", type=float, default=0.5, help="rate step in Mpps")
     parser.add_argument("--skew", type=float, default=0.6, help="Zipf skew of the load")
     parser.add_argument("--flows", type=int, default=10000)
-    parser.add_argument("--probe-ratio", type=float, default=0.001,
-                        help="probe rate as a fraction of the load (0.001: 1 kpps at 1 Mpps)")
+    parser.add_argument("--probe-pps", type=int, default=1000, help="rate of the latency probe")
     parser.add_argument("--warmup", type=float, default=2.0, help="seconds before each sample")
     parser.add_argument("--duration", type=float, default=5.0, help="seconds per sample")
     parser.add_argument("--repetitions", type=int, default=1)
@@ -366,7 +365,7 @@ def main():
     rows = []
     try:
         lat_queue = latency_queues(client, args.queues, args.rediscover)
-        load_streams(client, args.skew, args.flows, args.probe_ratio)
+        load_streams(client, args.skew, args.flows, args.probe_pps)
 
         total = len(args.queues) * len(args.policies) * len(rates) * args.repetitions
         pbar = tqdm(total=total, unit="pt")
@@ -396,9 +395,7 @@ def main():
     finally:
         if rows:
             write_summary(summary_csv, rows)
-        client.stop(ports=PORTS)
-        client.release(ports=PORTS)
-        client.disconnect()
+        ndz.release_trex(client)
         ndz.set_governor("schedutil")
     tqdm.write(f"Results in {results_dir}/")
 

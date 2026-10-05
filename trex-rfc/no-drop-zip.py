@@ -401,6 +401,19 @@ def stop_trex(client):
 
     tqdm.write("Traffic fully stopped.")
 
+def release_trex(client):
+    """Leave the TRex port without streams.
+
+    A client that connects syncs every stream already on the port, and with the
+    10000 Zipf streams that reply takes the server's RPC thread past its 1 s
+    watchdog, which aborts TRex (TrexRpcCmdGetAllStreams in the crash trace).
+    """
+    try:
+        client.stop(ports=PORTS)
+        client.reset(ports=PORTS)
+    finally:
+        client.disconnect()
+
 def clear_csv_files():
     """Rimuove i file CSV esistenti per risultati e medie"""
     for csv_file in ["benchmark_results.csv", "benchmark_averages.csv"]:
@@ -603,7 +616,7 @@ def main():
     finally:
         set_governor("schedutil")
         tqdm.write("\nDisconnessione...")
-        client.disconnect()
+        release_trex(client)
 
 
 if __name__ == "__main__":
