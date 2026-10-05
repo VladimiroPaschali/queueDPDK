@@ -375,6 +375,7 @@ cms_main_loop(uint16_t *penality_list)
 			portid = qconf->rx_port_list[i];
 			// for (int q = 1923; q < 1924; q++) {
 			for (int q = 0; q < cms_rx_queue_per_lcore; q++) {
+				static uint64_t burst_id = 0;
 				nb_rx = rte_eth_rx_burst(portid, q, pkts_burst, MAX_PKT_BURST);
 
 				uint64_t locality_factor     = 0;
@@ -450,10 +451,11 @@ cms_main_loop(uint16_t *penality_list)
 					// 	prev_dst_port = dst_port;
 					// 	prev_proto    = proto;
 					// }
-					printf("%d,%u,%u,%u,%u,%u\n",
-					   q, src_ip, dst_ip, src_port, dst_port, proto);
+					printf("%lu,%d,%u,%u,%u,%u,%u\n",
+					   burst_id, q, src_ip, dst_ip, src_port, dst_port, proto);
 					rte_pktmbuf_free(m);
 				}
+				burst_id++;
 				// chiudi l’ultimo blocco del burst
 				if (!first_packet) {
 					total_locality += locality_factor;

@@ -61,6 +61,7 @@ static volatile bool force_quit;
 uint16_t             portid = 0;
 
 #define MAX_PKT_BURST 32
+#define TX_BATCH_SIZE 512
 #define RTE_TEST_RX_DESC_DEFAULT 1024
 #define RTE_TEST_TX_DESC_DEFAULT 1024
 static uint16_t nb_rxd     = RTE_TEST_RX_DESC_DEFAULT;
@@ -140,7 +141,7 @@ static struct rte_eth_conf port_conf = {
 };
 
 
-int queue_hit[2048] = {1};
+/* queue_hit moved to per-lcore stack in main_loop to eliminate false sharing */
 struct mehcached_table  table_o;
 struct mehcached_table *table;
 static void
@@ -430,6 +431,13 @@ main_loop(__rte_unused void *dummy)
 		printf("entering main loop on lcore %u (idle, no RX queues assigned)\n", lcore_id);
 		return 0;
 	}
+
+	/* Per-lcore skip counters indexed by absolute queue id — no false sharing
+	 * vs the old global queue_hit[2048] since this lives on the stack */
+	int queue_hit_local[MAX_RX_QUEUE_PER_LCORE] __rte_cache_aligned;
+	for (int qi = 0; qi < (int)assigned_queues; qi++)
+		queue_hit_local[first_queue + qi] = skip;
+
 	printf("entering main loop on lcore %u (rx queues [%u, %u), tx queue %u)\n",
 	       lcore_id,
 	       first_queue,
@@ -462,20 +470,22 @@ main_loop(__rte_unused void *dummy)
 		prev_tsc = cur_tsc;
 
 		/*
-		 * Read packet from RX queues
+		 * Read packet from RX queues, accumulate into tx_batch, TX once.
 		 */
 		int max_loops = 100;
+		struct rte_mbuf *tx_batch[TX_BATCH_SIZE];
+		int tx_total = 0;
 
 		for (i = first_queue; i < last_queue; ++i) {
 
-			if ((skip > 0) && (queue_hit[i] < skip)) {
-				queue_hit[i]++;
+			if ((skip > 0) && (queue_hit_local[i] < skip)) {
+				queue_hit_local[i]++;
 				continue;
 			}
 
 			if (latency_mode && has_latency_queue && inject_queue) {
-				resume_i     = i;             // salva dove dovevi andare
-				i            = latency_queue; // inietta la coda specificata
+				resume_i     = i;
+				i            = latency_queue;
 				inject_queue = false;
 			}
 
@@ -486,7 +496,6 @@ main_loop(__rte_unused void *dummy)
 			rte_spinlock_unlock(&rx_queue_locks[portid][i]);
 
 			if (nb_rx > 0) {
-
 				ret = mica_process_burst(pkts_burst, nb_rx);
 				if (ret == 1) {
 					printf("Received stop signal, exiting main loop\n");
@@ -494,19 +503,24 @@ main_loop(__rte_unused void *dummy)
 					break;
 				}
 
-				uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, pkts_burst, nb_rx);
-
-			}
-			if (latency_mode && has_latency_queue) {
-
-				/* se abbiamo appena fatto una 27 iniettata */
-				if (resume_i != -1 && i == latency_queue) {
-					i        = resume_i - 1; // -1 per compensare i++
-					resume_i = -1;
+				if (unlikely(tx_total + nb_rx > TX_BATCH_SIZE)) {
+					uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, tx_batch, tx_total);
+					if (nb_tx < (uint16_t)tx_total) {
+						for (int j = nb_tx; j < tx_total; j++)
+							rte_pktmbuf_free(tx_batch[j]);
+					}
+					tx_total = 0;
 				}
+				rte_memcpy(&tx_batch[tx_total], pkts_burst,
+				           nb_rx * sizeof(struct rte_mbuf *));
+				tx_total += nb_rx;
+			}
 
-				/* conta SOLO le code normali, ESCLUDI la 27 */
-				else if (i != latency_queue) {
+			if (latency_mode && has_latency_queue) {
+				if (resume_i != -1 && i == latency_queue) {
+					i        = resume_i - 1;
+					resume_i = -1;
+				} else if (i != latency_queue) {
 					latency_count++;
 					if (latency_count == latency_period) {
 						latency_count = 0;
@@ -516,13 +530,21 @@ main_loop(__rte_unused void *dummy)
 			}
 
 			if (skip > 0 && max_loops == 100)
-				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
+				queue_hit_local[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 				i--;
 				max_loops--;
 			} else {
 				max_loops = 100;
+			}
+		}
+
+		if (tx_total > 0) {
+			uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, tx_batch, tx_total);
+			if (nb_tx < (uint16_t)tx_total) {
+				for (int j = nb_tx; j < tx_total; j++)
+					rte_pktmbuf_free(tx_batch[j]);
 			}
 		}
 	}
@@ -811,9 +833,6 @@ main(int argc, char **argv)
 	if (!mbuf_pool)
 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
 
-	for (int i = 0; i < 2048; i++) {
-		queue_hit[i] = skip;
-	}
 	init_rx_queue_locks();
 
 	// QueueDPDK setup

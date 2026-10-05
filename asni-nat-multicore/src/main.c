@@ -62,14 +62,14 @@
 #define MAX_JUMBO_PKT_LEN 9600
 
 #define MEMPOOL_CACHE_SIZE 256
+// #define HASHFN_N 8
 #define HASHFN_N 16
-// #define HASHFN_N 40
 
-#define COLUMNS 1048576
-// #define COLUMNS 1024
+// #define COLUMNS 4096
+#define COLUMNS 65536
 
 struct countmin {
-	uint64_t **values;
+	uint64_t values[HASHFN_N][COLUMNS];
 };
 
 struct countmin     *cm_per_core[RTE_MAX_LCORE];
@@ -89,6 +89,7 @@ static volatile bool force_quit;
 	        (unsigned)8192)
 
 #define MAX_PKT_BURST 32
+#define TX_BATCH_SIZE 512  /* max accumulated TX pkts across all queues per loop */
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 
 #define NB_SOCKETS 8
@@ -169,9 +170,8 @@ static struct rte_eth_conf port_conf = {
         },
 };
 
-// static struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
-// struct rte_mempool *pktmbuf_pool = NULL;
-struct rte_mempool *pktmbuf_pool[1024] = {NULL};
+/* One mbuf pool per lcore to reduce contention */
+struct rte_mempool *pktmbuf_pool[RTE_MAX_LCORE] = {NULL};
 
 /* ethernet addresses of ports */
 static struct rte_ether_hdr port_l2hdr[RTE_MAX_ETHPORTS];
@@ -1583,7 +1583,7 @@ static int
 main_loop(__rte_unused void *dummy)
 {
 	struct rte_mbuf   *pkts_burst[MAX_PKT_BURST];
-	int                queue_hit_local[MAX_RX_QUEUE_PER_LCORE];
+	int                queue_hit_local[MAX_RX_QUEUE_PER_LCORE] __rte_cache_aligned;
 	unsigned           lcore_id;
 	int                i, nb_rx;
 	uint16_t           portid;
@@ -1621,11 +1621,11 @@ main_loop(__rte_unused void *dummy)
 	if (total_lcores == 0)
 		total_lcores = 1;
 
-	for (i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++)
-		queue_hit_local[i] = skip;
-
 	queue_start = (int)(((uint32_t)queues * lcore_pos) / total_lcores);
 	queue_end   = (int)(((uint32_t)queues * (lcore_pos + 1)) / total_lcores);
+
+	for (i = 0; i < queue_end - queue_start; i++)
+		queue_hit_local[i] = skip;
 	tx_queueid  = (uint16_t)lcore_pos;
 
 	if (tx_queueid >= MAX_TX_QUEUE_PER_PORT) {
@@ -1658,49 +1658,45 @@ main_loop(__rte_unused void *dummy)
 	RTE_LOG(INFO, L3FWD, "lcore %u tx queue %u\n", lcore_id, tx_queueid);
 	fflush(stdout);
 
+	struct rte_mbuf *tx_batch[TX_BATCH_SIZE];
+
 	while (!force_quit) {
 
 		/*
-		 * Read packet from RX queues
+		 * Read packet from RX queues, accumulate into tx_batch, then TX once.
+		 * This amortizes per-burst QDMA overhead (MMIO write + sfence) across
+		 * all queues assigned to this lcore instead of paying it per queue.
 		 */
 		int max_loops = 100;
+		int tx_total  = 0;
 
 		for (i = queue_start; i < queue_end; ++i) {
+			int qi = i - queue_start; /* relative index into queue_hit_local */
 
-			if ((skip > 0) && (queue_hit_local[i] < skip)) {
-				queue_hit_local[i]++;
-				// printf("queue %d skip %d\n", i, queue_hit_local[i]);
+			if ((skip > 0) && (queue_hit_local[qi] < skip)) {
+				queue_hit_local[qi]++;
 				continue;
 			}
 
 			if (latency_mode && has_latency_queue && inject_queue) {
-				resume_i     = i;             // salva dove dovevi andare
-				i            = latency_queue; // inietta la coda specificata
+				resume_i     = i;
+				i            = latency_queue;
 				inject_queue = false;
 			}
-			// printf("queue %d\n", i);
-			// printf("queue %d skip %d\n", i, queue_hit_local[i]);
 
 			portid = rx_portid;
-			// queueid = qconf->rx_queue_list[i].queue_id;
 			nb_rx = rte_eth_rx_burst(portid, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
-			// printf("core %u queue %d received %d packets\n", lcore_id, i, nb_rx);
 
 			if (nb_rx > 0) {
-				// printf("queueid=%hhu\n", queueid);
 				struct acl_search_t acl_search;
 
-				// // qui prefetcha
 				prepare_acl_parameter(pkts_burst, &acl_search, nb_rx);
 
 				ret = nf_process_burst(pkts_burst, nb_rx, portid);
 				if (ret == 1) {
 					printf("stopping\n");
-					return 0; // received stop signal
+					return 0;
 				}
-				// else if (ret == 2) {
-				// 	printf("latency packet received on queue %d\n", i);
-				// }
 
 				if (acl_search.num_ipv4) {
 					rte_acl_classify(acl_config.acx_ipv4[socketid],
@@ -1717,26 +1713,26 @@ main_loop(__rte_unused void *dummy)
 					                 acl_search.num_ipv6,
 					                 DEFAULT_MAX_CATEGORIES);
 				}
-				// send_packets_always(pkts_burst, NULL, nb_rx, portid);
-				// printf("core %u rx %d tx %d processed %d packets\n", lcore_id, i, tx_queueid, nb_rx);
-				uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queueid, pkts_burst, nb_rx);
-				if (nb_tx < nb_rx) {
-					// printf("err\n");
-					for (int j = nb_tx; j < nb_rx; j++)
-						rte_pktmbuf_free(pkts_burst[j]);
-				}
 
+				/* Accumulate into tx_batch; flush early if nearly full */
+				if (unlikely(tx_total + nb_rx > TX_BATCH_SIZE)) {
+					uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queueid, tx_batch, tx_total);
+					if (nb_tx < (uint16_t)tx_total) {
+						for (int j = nb_tx; j < tx_total; j++)
+							rte_pktmbuf_free(tx_batch[j]);
+					}
+					tx_total = 0;
+				}
+				rte_memcpy(&tx_batch[tx_total], pkts_burst,
+				           nb_rx * sizeof(struct rte_mbuf *));
+				tx_total += nb_rx;
 			}
+
 			if (latency_mode && has_latency_queue) {
-
-				/* se abbiamo appena fatto una 27 iniettata */
 				if (resume_i != -1 && i == latency_queue) {
-					i        = resume_i - 1; // -1 per compensare i++
+					i        = resume_i - 1;
 					resume_i = -1;
-				}
-
-				/* conta SOLO le code normali, ESCLUDI la 27 */
-				else if (i != latency_queue) {
+				} else if (i != latency_queue) {
 					latency_count++;
 					if (latency_count == latency_period) {
 						latency_count = 0;
@@ -1746,7 +1742,7 @@ main_loop(__rte_unused void *dummy)
 			}
 
 			if (skip > 0 && max_loops == 100)
-				queue_hit_local[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
+				queue_hit_local[qi] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 				i--;
@@ -1754,7 +1750,15 @@ main_loop(__rte_unused void *dummy)
 			} else {
 				max_loops = 100;
 			}
+		}
 
+		/* Single TX for all packets collected across all queues this iteration */
+		if (tx_total > 0) {
+			uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queueid, tx_batch, tx_total);
+			if (nb_tx < (uint16_t)tx_total) {
+				for (int j = nb_tx; j < tx_total; j++)
+					rte_pktmbuf_free(tx_batch[j]);
+			}
 		}
 	}
 	return 0;
@@ -2332,64 +2336,25 @@ signal_handler(int signum)
 	}
 }
 
-static struct rte_mempool *
-create_extbuf_pool(const char *name,
-                   uint16_t    nb_ports,
-                   uint16_t    rx_queue_per_lcore,
-                   uint16_t    nb_rxd,
-                   uint16_t    nb_txd,
-                   uint16_t    nb_lcores,
-                   int         socket_id)
+/* Calculate which lcore will process a given rx queue */
+static inline unsigned
+get_lcore_for_queue(unsigned queue_id, unsigned total_queues, unsigned total_lcores)
 {
-	uint32_t nb_mbuf;
-
-	nb_mbuf = RTE_MAX(rx_queue_per_lcore * nb_ports *
-	                      (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE),
-	                  8192U);
-
-	const uint16_t data_room_size = RTE_MBUF_DEFAULT_BUF_SIZE;
-	const uint16_t priv_size      = 0;
-
-	/* Total memory needed */
-	size_t buf_len    = RTE_ALIGN_CEIL(192 + data_room_size, RTE_CACHE_LINE_SIZE); // 2368 2176
-	size_t total_size = (size_t)nb_mbuf * buf_len;
-
-	/* Allocate contiguous DMA-safe memory */
-	void *buf_addr = rte_malloc(NULL, total_size, RTE_CACHE_LINE_SIZE);
-	if (!buf_addr) {
-		rte_exit(EXIT_FAILURE, "Cannot allocate extbuf memory\n");
+	unsigned lcore_pos = 0;
+	unsigned lcore_id;
+	
+	RTE_LCORE_FOREACH(lcore_id) {
+		int queue_start = (int)(((uint32_t)total_queues * lcore_pos) / total_lcores);
+		int queue_end = (int)(((uint32_t)total_queues * (lcore_pos + 1)) / total_lcores);
+		
+		if (queue_id >= queue_start && queue_id < queue_end)
+			return lcore_id;
+		
+		lcore_pos++;
 	}
-
-	/* Get IOVA */
-	rte_iova_t buf_iova = rte_malloc_virt2iova(buf_addr);
-	if (buf_iova == RTE_BAD_IOVA) {
-		rte_exit(EXIT_FAILURE, "IOVA translation failed\n");
-	}
-
-	/* Describe external memory region */
-	struct rte_pktmbuf_extmem extmem = {
-	    .buf_ptr  = buf_addr,
-	    .buf_iova = buf_iova,
-	    .buf_len  = total_size,
-	    .elt_size = buf_len,
-	};
-
-	/* Create mempool */
-	struct rte_mempool *mp = rte_pktmbuf_pool_create_extbuf(name,
-	                                                        nb_mbuf,
-	                                                        MEMPOOL_CACHE_SIZE,
-	                                                        priv_size,
-	                                                        data_room_size,
-	                                                        socket_id,
-	                                                        &extmem,
-	                                                        1 /* number of extmem segments */
-	);
-
-	if (mp == NULL) {
-		rte_exit(EXIT_FAILURE, "Cannot create extbuf pool\n");
-	}
-
-	return mp;
+	
+	/* Fallback to first lcore */
+	return rte_lcore_id();
 }
 
 int
@@ -2449,48 +2414,28 @@ main(int argc, char **argv)
 
 	nb_lcores = rte_lcore_count();
 
-	int nb_mbufs = RTE_MAX(
-	    queues * 1 * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
+	/* Create one mbuf pool per lcore to reduce contention on memory allocation */
+	/* Each lcore owns queues/nb_lcores queues, size the pool accordingly */
+	uint32_t queues_per_lcore = (queues + nb_lcores - 1) / nb_lcores;
+	RTE_LCORE_FOREACH(lcore_id) {
+		char pool_name[64];
+		snprintf(pool_name, sizeof(pool_name), "mbuf_pool_lcore_%u", lcore_id);
 
-	int contiguous = 0;
-	if (!contiguous) {
-		/* create the mbuf pool */
-		pktmbuf_pool[0] = rte_pktmbuf_pool_create("mbuf_pool",
-		                                          nb_mbufs,
-		                                          MEMPOOL_CACHE_SIZE,
-		                                          0,
-		                                          RTE_MBUF_DEFAULT_BUF_SIZE,
-		                                          rte_socket_id());
-
-		if (pktmbuf_pool[0] == NULL)
-			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
-
-	} else {
-		for (int i = 0; i < queues; i++) {
-			char pool_name[32];
-			snprintf(pool_name, sizeof(pool_name), "mbuf_pool_%d", i);
-			nb_mbufs =
-			    nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE);
-
-			pktmbuf_pool[i] = create_extbuf_pool(
-			    pool_name, nb_ports, 1, nb_rxd, nb_txd, nb_lcores, rte_socket_id());
-
-			if (pktmbuf_pool[i] == NULL)
-				rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
-		}
+		uint32_t lcore_nb_mbufs = RTE_MAX(
+			queues_per_lcore * (nb_rxd + MAX_PKT_BURST) + nb_txd + MEMPOOL_CACHE_SIZE,
+			8192U);
+		
+		pktmbuf_pool[lcore_id] = rte_pktmbuf_pool_create(
+			pool_name,
+			lcore_nb_mbufs,
+			MEMPOOL_CACHE_SIZE,
+			0,
+			RTE_MBUF_DEFAULT_BUF_SIZE,
+			rte_lcore_to_socket_id(lcore_id));
+		
+		if (pktmbuf_pool[lcore_id] == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for lcore %u\n", lcore_id);
 	}
-
-	// if (rte_mempool_set_ops_byname(pktmbuf_pool, "stack", NULL) < 0)
-	// 	rte_panic("mempool_set_ops stack failed\n");
-
-	// struct rte_pktmbuf_pool_private *priv = rte_mempool_get_priv(pktmbuf_pool);
-
-	// priv->mbuf_data_room_size = RTE_MBUF_DEFAULT_BUF_SIZE;
-	// priv->mbuf_priv_size      = 0;
-
-	// if (rte_mempool_populate_default(pktmbuf_pool) < 0)
-	// 	rte_panic("mempool_populate_default failed\n");
-	// rte_mempool_obj_iter(pktmbuf_pool, rte_pktmbuf_init, NULL);
 
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)
@@ -2656,18 +2601,15 @@ main(int argc, char **argv)
 				         "rte_pmd_qdma_set_queue_mode : "
 				         "Passing of STREAMING_MODE "
 				         "failed\n");
-			if (contiguous) {
-				ret = rte_eth_rx_queue_setup(
-				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[x]);
-				if (ret < 0)
-					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
-
-			} else {
-				ret = rte_eth_rx_queue_setup(
-				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[0]);
-				if (ret < 0)
-					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
-			}
+			
+			/* Determine which lcore will process this queue */
+			unsigned queue_lcore = get_lcore_for_queue(x, queues, nb_lcores);
+			
+			ret = rte_eth_rx_queue_setup(
+				portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, 
+				pktmbuf_pool[queue_lcore]);
+			if (ret < 0)
+				rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
 		}
 	}
 
@@ -2700,19 +2642,12 @@ main(int argc, char **argv)
 		}
 	}
 
-	// start - allocate CMS per core
+	// start - allocate CMS per core (single contiguous block per core)
 	RTE_LCORE_FOREACH(lcore_id) {
-		cm_per_core[lcore_id] = rte_zmalloc(NULL, sizeof(struct countmin), 64);
-		cm_per_core[lcore_id]->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
-		for (int i = 0; i < HASHFN_N; i++) {
-			cm_per_core[lcore_id]->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * COLUMNS, 64);
-		}
-
-		for (int i = 0; i < HASHFN_N; i++) {
-			for (int j = 0; j < COLUMNS; j++) {
-				cm_per_core[lcore_id]->values[i][j] = 0;
-			}
-		}
+		cm_per_core[lcore_id] = rte_zmalloc_socket(NULL, sizeof(struct countmin), 64,
+		                                            rte_lcore_to_socket_id(lcore_id));
+		if (cm_per_core[lcore_id] == NULL)
+			rte_exit(EXIT_FAILURE, "Failed to allocate CMS for lcore %u\n", lcore_id);
 	}
 	check_all_ports_link_status(enabled_port_mask);
 
@@ -2752,10 +2687,6 @@ main(int argc, char **argv)
 
 	// free countmin per core
 	RTE_LCORE_FOREACH(lcore_id) {
-		for (int i = 0; i < HASHFN_N; i++) {
-			rte_free(cm_per_core[lcore_id]->values[i]);
-		}
-		rte_free(cm_per_core[lcore_id]->values);
 		rte_free(cm_per_core[lcore_id]);
 	}
 

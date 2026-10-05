@@ -1,0 +1,23 @@
+{
+    "ifpci": "0000:16:00.1",
+    "exp-dir": "/home/vladimiro/dpdk_patched/queueDPDK/toasty-mica",
+    "time": 20,
+    "repetitions":5,
+    "type": "dpdk-rfc",
+    "progs": [
+        {
+            "name": "toasty-mica",
+            "path": "build/toasty-mica",
+            "dpdk-args": "-d librte_net_qdma.so -l 4 -n 4",
+            "app-args": ""
+        }
+    ],
+    "queues":[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+    "descriptors": [1024],
+    "cms": [1048576],
+    "aggressive": ["-a -s 5", "-s 20","-s 50"],
+    "prefetch" :[0],
+    "throughput": true,
+    "cpu": 4,
+    "per-pkt": true
+}

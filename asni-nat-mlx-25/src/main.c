@@ -2,7 +2,6 @@
  * Copyright(c) 2010-2016 Intel Corporation
  */
 
-#include "rte_pmd_qdma.h"
 #include "nat_flowmanager.h"
 #include "utils/vigor-time.h"
 #include "nat_main.h"
@@ -47,7 +46,6 @@
 #include <rte_udp.h>
 #include <rte_string_fns.h>
 #include <rte_acl.h>
-#include <rte_spinlock.h>
 
 #include <cmdline_parse.h>
 #include <cmdline_parse_etheraddr.h>
@@ -73,7 +71,7 @@ struct countmin {
 	uint64_t **values;
 };
 
-struct countmin     *cm_per_core[RTE_MAX_LCORE];
+struct countmin     *cm;
 static volatile bool force_quit;
 
 /*
@@ -90,7 +88,6 @@ static volatile bool force_quit;
 	        (unsigned)8192)
 
 #define MAX_PKT_BURST 32
-#define TX_BATCH_SIZE 512
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 
 #define NB_SOCKETS 8
@@ -109,15 +106,24 @@ static uint16_t queues     = 2;
 static bool     aggressive = false;
 bool            verbose    = false;
 uint32_t        skip       = 0;
+uint32_t        empty      = 0;
+uint32_t        total      = 0;
+uint32_t        spin_time  = 0;
+uint32_t        n_bursts   = 0;
+uint32_t        spin_pkt   = 0;
+uint32_t        n_pkts     = 0;
 
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
-static uint64_t timer_period = 3096000000; /* default period is 1 second */
+static uint64_t timer_period        = 3096000000; /* default period is 1 second */
+uint64_t        measured_packets_rx = 0;
 
 /* mask of enabled ports */
 static uint32_t enabled_port_mask;
-static int      promiscuous_on;        /**< Ports set in promiscuous mode off by default. */
+static int      promiscuous_on = 1;    /**< Ports set in promiscuous mode on by default. */
 static int      numa_on       = 1;     /**< NUMA is enabled by default. */
+bool            after_warmup  = false; /* reset statistics after warmup time */
+uint64_t        measured_tick = 0;
 
 struct lcore_rx_queue {
 	uint16_t port_id;
@@ -126,8 +132,15 @@ struct lcore_rx_queue {
 
 #define MAX_RX_QUEUE_PER_LCORE 2048
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
-#define MAX_RX_QUEUE_PER_PORT 2048
-static rte_spinlock_t rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
+#define MAX_RX_QUEUE_PER_PORT 128
+
+/* Per-port statistics struct */
+struct port_statistics {
+	uint64_t tx;
+	uint64_t rx;
+	uint64_t dropped;
+} __rte_cache_aligned;
+struct port_statistics port_statistics[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LCORE];
 
 #define MAX_LCORE_PARAMS 1024
 struct lcore_params {
@@ -153,32 +166,22 @@ static struct lcore_params *lcore_params = lcore_params_array_default;
 static uint16_t             nb_lcore_params =
     sizeof(lcore_params_array_default) / sizeof(lcore_params_array_default[0]);
 
-static void
-init_rx_queue_locks(void)
-{
-	for (uint16_t pid = 0; pid < RTE_MAX_ETHPORTS; pid++) {
-		for (uint16_t qid = 0; qid < MAX_RX_QUEUE_PER_PORT; qid++) {
-			rte_spinlock_init(&rx_queue_locks[pid][qid]);
-		}
-	}
-}
-
 static struct rte_eth_conf port_conf = {
     .rxmode =
         {
-            .mq_mode = ETH_MQ_RX_RSS,
+            .mq_mode = RTE_ETH_MQ_RX_RSS,
         },
     .rx_adv_conf =
         {
             .rss_conf =
                 {
                     .rss_key = NULL,
-                    .rss_hf  = ETH_RSS_IP | ETH_RSS_UDP | ETH_RSS_TCP | ETH_RSS_SCTP,
+                    .rss_hf  = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_SCTP,
                 },
         },
     .txmode =
         {
-            .mq_mode = ETH_MQ_TX_NONE,
+            .mq_mode = RTE_ETH_MQ_TX_NONE,
         },
 };
 
@@ -704,18 +707,14 @@ prepare_one_packet(struct rte_mbuf **pkts_in, struct acl_search_t *acl, int inde
 			acl->m_ipv4[(acl->num_ipv4)++] = pkt;
 
 		} else {
-			/* Not a valid IPv4 packet */
-			rte_pktmbuf_free(pkt);
+			/* Invalid IPv4: skip ACL but keep mbuf alive for TX */
 		}
 	} else if (RTE_ETH_IS_IPV6_HDR(pkt->packet_type)) {
 		/* Fill acl structure */
 		acl->data_ipv6[acl->num_ipv6]  = MBUF_IPV6_2PROTO(pkt);
 		acl->m_ipv6[(acl->num_ipv6)++] = pkt;
 
-	} else {
-		/* Unknown type, drop the packet */
-		rte_pktmbuf_free(pkt);
-	}
+	} /* else: unknown type — keep mbuf alive for TX, skip ACL */
 }
 
 #else
@@ -733,10 +732,7 @@ prepare_one_packet(struct rte_mbuf **pkts_in, struct acl_search_t *acl, int inde
 		/* Fill acl structure */
 		acl->data_ipv6[acl->num_ipv6]  = MBUF_IPV6_2PROTO(pkt);
 		acl->m_ipv6[(acl->num_ipv6)++] = pkt;
-	} else {
-		/* Unknown type, drop the packet */
-		rte_pktmbuf_free(pkt);
-	}
+	} /* else: keep mbuf alive for TX */
 }
 #endif /* DO_RFC_1812_CHECKS */
 
@@ -1375,7 +1371,7 @@ send_single_packet(struct rte_mbuf *m, uint16_t port)
 
 	/* update src and dst mac*/
 	eh = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-	memcpy(eh, &port_l2hdr[port], sizeof(eh->d_addr) + sizeof(eh->s_addr));
+	memcpy(eh, &port_l2hdr[port], sizeof(eh->dst_addr) + sizeof(eh->src_addr));
 	qconf = &lcore_conf[lcore_id];
 	rte_eth_tx_buffer(port, qconf->tx_queue_id[port], qconf->tx_buffer[port], m);
 }
@@ -1420,9 +1416,202 @@ is_valid_ipv4_pkt(struct rte_ipv4_hdr *pkt, uint32_t link_len)
 	return 0;
 }
 #endif
+int queue_stat[5]   = {0, 0, 0, -1, 0};
+int queue_hit[2048] = {1};
 static void
 print_stats(void)
 {
+	uint64_t        total_packets_dropped = 0, total_packets_tx = 0, total_packets_rx = 0;
+	static uint64_t total_packets_tx_prev = 0, total_packets_rx_prev = 0,
+	                total_packets_dropped_prev = 0;
+
+	unsigned portid;
+
+	/* Static variables to store previous statistics */
+	static uint64_t prev_tx[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LCORE]      = {0};
+	static uint64_t prev_rx[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LCORE]      = {0};
+	static uint64_t prev_dropped[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_LCORE] = {0};
+
+	const char clr[]     = {27, '[', '2', 'J', '\0'};
+	const char topLeft[] = {27, '[', '1', ';', '1', 'H', '\0'};
+
+	/* Clear screen and move to top left */
+	printf("%s%s", clr, topLeft);
+	int active = 0;
+	printf("\nPort statistics ====================================");
+
+	for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+		/* skip disabled ports */
+		if ((enabled_port_mask & (1 << portid)) == 0)
+			continue;
+
+		for (int q = 0; q < queues; q++) {
+
+			uint64_t diff_tx      = port_statistics[portid][q].tx - prev_tx[portid][q];
+			uint64_t diff_rx      = port_statistics[portid][q].rx - prev_rx[portid][q];
+			uint64_t diff_dropped = port_statistics[portid][q].dropped - prev_dropped[portid][q];
+
+			if (diff_tx == 0 && diff_rx == 0 && diff_dropped == 0)
+				continue;
+			active++;
+			if (verbose)
+				printf("\nStatistics for port %u queue: %d ------------------------------"
+				       "\nPackets sent:     %'20llu (diff: %'llu)"
+				       "\nPackets received: %'20llu (diff: %'llu)"
+				       "\nPackets dropped:  %'20llu (diff: %'llu)\n",
+				       portid,
+				       q,
+				       (unsigned long long)port_statistics[portid][q].tx,
+				       (unsigned long long)diff_tx,
+				       (unsigned long long)port_statistics[portid][q].rx,
+				       (unsigned long long)diff_rx,
+				       (unsigned long long)port_statistics[portid][q].dropped,
+				       (unsigned long long)diff_dropped);
+
+			total_packets_dropped += port_statistics[portid][q].dropped;
+			total_packets_tx += port_statistics[portid][q].tx;
+			total_packets_rx += port_statistics[portid][q].rx;
+			/* Update previous statistics */
+			prev_tx[portid][q]      = port_statistics[portid][q].tx;
+			prev_rx[portid][q]      = port_statistics[portid][q].rx;
+			prev_dropped[portid][q] = port_statistics[portid][q].dropped;
+		}
+	}
+	printf("\nAggregate statistics ==============================="
+	       "\nActive queues:          %'14d"
+	       "\nTotal Packets sent:     %'14llu (diff: %'llu)"
+	       "\nTotal Packets received: %'14llu (diff: %'llu)"
+	       "\nTotal Packets dropped:  %'14llu (diff: %'llu)\n",
+	       active,
+	       (unsigned long long)total_packets_tx,
+	       (unsigned long long)(total_packets_tx - total_packets_tx_prev),
+	       (unsigned long long)total_packets_rx,
+	       (unsigned long long)(total_packets_rx - total_packets_rx_prev),
+	       (unsigned long long)total_packets_dropped,
+	       (unsigned long long)(total_packets_dropped - total_packets_dropped_prev));
+	printf("\nspin/sec (the poll read less than a BURST): %u (%u)\n",
+	       spin_time,
+	       spin_pkt / (spin_time + 1));
+	// printf("miss: %u\n", miss);
+	printf("empty/sec (the poll read no packets): %u\n", empty);
+	printf("not full (resets every second): %u\n", spin_time);
+
+	// printf("total (burst in a second): %u (%u)\n", total, spin_pkt / (total + 1));
+	// printf("packets/burst: %u\n", n_bursts == 0 ? 0 : spin_pkt / n_bursts);
+	printf("n_bursts (resets every second): %u\n", n_bursts);
+	printf("pkts (resets every second): %u\n", n_pkts);
+	printf("pkts/burst (resets every second): %.2f\n",
+	       n_bursts == 0 ? 0 : (float)n_pkts / n_bursts);
+	printf("empty/burst (resets every second): %.2f\n",
+	       n_bursts == 0 ? 0 : (float)empty / n_bursts);
+	printf("not-full/burst (resets every second): %.2f\n",
+	       n_bursts == 0 ? 0 : (float)spin_time / n_bursts);
+	active    = 0;
+	empty     = 0;
+	spin_time = 0;
+	spin_pkt  = 0;
+	total     = 0;
+	n_bursts  = 0;
+	n_pkts    = 0;
+	if (aggressive)
+		printf("With aggressive policy\n");
+	else
+		printf("Without aggressive policy\n");
+	if (skip)
+		printf("With skip policy: %d\n", skip);
+	else
+		printf("Without skip policy\n");
+	printf("RX queues: %u\n", queues);
+	printf("\n====================================================\n");
+	// if (after_warmup)
+	// 	measured_packets_rx += (total_packets_rx - total_packets_rx_prev);
+	if (after_warmup)
+		measured_tick++;
+	/* Reset previous statistics */
+	total_packets_tx_prev      = total_packets_tx;
+	total_packets_rx_prev      = total_packets_rx;
+	total_packets_dropped_prev = total_packets_dropped;
+
+	printf("\n====================================================\n");
+	printf("pending work for queue %d is %u total is %u\n", queue_stat[0], queue_stat[1], queue_stat[2]);
+	printf("pending work for queue %d is %d total is %d\n", queue_stat[0], queue_stat[1], queue_stat[2]);
+	// printf("Read IAR (no work): %u\n", queue_stat[0]);
+	// printf("Read #queues : %u (%'d)\n", queue_stat[1],queue_stat[1]*MAX_PKT_BURST);
+	// printf("Read #bundle : %u \n", queue_stat[2]);
+	// printf("Read #pkts : %'u \n", queue_stat[3]);
+	// printf("Read #changes : %u \n", queue_stat[4]);
+	// queue_stat[0]=0;
+	// queue_stat[1]=0;
+	// queue_stat[2]=0;
+	// queue_stat[3]=0;
+	// queue_stat[4]=0;
+	printf("\n====================================================\n");
+	fflush(stdout);
+}
+
+static int
+print_queue_packet_histogram_cmp_desc(const void *a, const void *b)
+{
+	struct queue_pkt_entry {
+		unsigned q;
+		uint64_t packets;
+	};
+	const struct queue_pkt_entry *ea = (const struct queue_pkt_entry *)a;
+	const struct queue_pkt_entry *eb = (const struct queue_pkt_entry *)b;
+
+	if (ea->packets < eb->packets)
+		return 1;
+	if (ea->packets > eb->packets)
+		return -1;
+	if (ea->q < eb->q)
+		return -1;
+	if (ea->q > eb->q)
+		return 1;
+	return 0;
+}
+
+static void
+print_queue_packet_histogram(void)
+{
+	struct queue_pkt_entry {
+		unsigned q;
+		uint64_t packets;
+	};
+	struct queue_pkt_entry entries[MAX_RX_QUEUE_PER_LCORE];
+	uint64_t total_packets = 0;
+	unsigned n_queues   = queues < MAX_RX_QUEUE_PER_LCORE ? queues : MAX_RX_QUEUE_PER_LCORE;
+
+	for (unsigned q = 0; q < n_queues; q++) {
+		entries[q].q       = q;
+		entries[q].packets = 0;
+	}
+
+	for (unsigned portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+		if ((enabled_port_mask & (1 << portid)) == 0)
+			continue;
+
+		for (unsigned q = 0; q < n_queues; q++) {
+			entries[q].packets += port_statistics[portid][q].rx;
+		}
+	}
+
+	for (unsigned q = 0; q < n_queues; q++)
+		total_packets += entries[q].packets;
+
+	qsort(entries, n_queues, sizeof(entries[0]), print_queue_packet_histogram_cmp_desc);
+
+	printf("\nPacket histogram per queue (total processed) ============\n");
+	printf("Total packets: %'llu\n", (unsigned long long)total_packets);
+
+	for (unsigned i = 0; i < n_queues; i++) {
+		double pct =
+		    total_packets ? (100.0 * (double)entries[i].packets / (double)total_packets) : 0.0;
+		printf("queue=%3u -> %'20llu (%6.2f%%)\n",
+		       entries[i].q,
+		       (unsigned long long)entries[i].packets,
+		       pct);
+	}
+	printf("==========================================================\n");
 }
 
 static inline uint32_t
@@ -1517,8 +1706,6 @@ count_add(struct rte_mbuf *m)
 	// }
 
 	// --- calcolo hash sui campi della 5-tuple ---
-	unsigned lcore_id = rte_lcore_id();
-	struct countmin *cm = cm_per_core[lcore_id];
 	for (int i = 0; i < HASHFN_N; i++) {
 		uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
 		uint32_t target_idx = h & (COLUMNS - 1);
@@ -1542,8 +1729,9 @@ count_add(struct rte_mbuf *m)
 	// }
 }
 
+uint64_t end_time = 0;
 static int
-nf_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts, uint16_t portid, uint16_t rx_queue_id)
+nf_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts, uint16_t portid)
 {
 	for (int i = 0; i < nb_pkts; i++) {
 
@@ -1577,7 +1765,6 @@ nf_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts, uint16_t portid, uin
 		// }
 
 		uint16_t dst_device = nf_process(portid,
-		                                 rx_queue_id,
 		                                 payload,
 		                                 eth_type,
 		                                 ip_proto,
@@ -1597,12 +1784,16 @@ static int
 main_loop(__rte_unused void *dummy)
 {
 	struct rte_mbuf   *pkts_burst[MAX_PKT_BURST];
-	int                queue_hit_local[MAX_RX_QUEUE_PER_LCORE];
 	unsigned           lcore_id;
+	uint64_t           prev_tsc, diff_tsc, cur_tsc, timer_tsc, end_warmup;
 	int                i, nb_rx;
 	uint16_t           portid;
+	uint8_t            queueid;
 	struct lcore_conf *qconf;
 	int                socketid;
+	const uint64_t     drain_tsc = (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * BURST_TX_DRAIN_US;
+	timer_tsc                    = 0;
+	prev_tsc                     = 0;
 	lcore_id                     = rte_lcore_id();
 	qconf                        = &lcore_conf[lcore_id];
 	socketid                     = rte_lcore_to_socket_id(lcore_id);
@@ -1615,106 +1806,76 @@ main_loop(__rte_unused void *dummy)
 	int  resume_i       = -1;
 	int  latency_queue  = 27; // coda latency con 64 code totali
 	// int latency_queue = queues -1 ; // ultima coda simulata latency
-
-	unsigned total_lcores = rte_lcore_count();
-	unsigned lcore_pos    = 0;
-	unsigned iter_lcore   = 0;
-	int      queue_start;
-	int      queue_end;
-	bool     has_latency_queue;
-	uint16_t tx_queueid;
-	uint16_t rx_portid = RTE_MAX_ETHPORTS;
-
-	RTE_LCORE_FOREACH(iter_lcore)
-	{
-		if (iter_lcore == lcore_id)
-			break;
-		lcore_pos++;
-	}
-
-	if (total_lcores == 0)
-		total_lcores = 1;
-
-	for (i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++)
-		queue_hit_local[i] = skip;
-
-	if (queues > MAX_RX_QUEUE_PER_PORT) {
-		RTE_LOG(ERR, L3FWD, "invalid number of RX queues %u\n", queues);
-		return -1;
-	}
-
-	queue_start = 0;
-	queue_end   = (int)queues;
-	tx_queueid  = (uint16_t)lcore_pos;
-
-	if (tx_queueid >= MAX_TX_QUEUE_PER_PORT) {
-		RTE_LOG(ERR, L3FWD, "invalid tx queue id %u for lcore %u\n", tx_queueid, lcore_id);
-		return -1;
-	}
-
-	if (qconf->n_rx_queue > 0)
-		rx_portid = qconf->rx_queue_list[0].port_id;
-
-	if (rx_portid >= RTE_MAX_ETHPORTS) {
-		for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
-			if ((enabled_port_mask & (1u << portid)) != 0) {
-				rx_portid = portid;
-				break;
-			}
-		}
-	}
-
-	if (rx_portid >= RTE_MAX_ETHPORTS) {
-		RTE_LOG(ERR, L3FWD, "no enabled port found for lcore %u\n", lcore_id);
-		return -1;
-	}
-
-	has_latency_queue = (latency_queue >= queue_start && latency_queue < queue_end);
-
 	printf("ready\n");
 	RTE_LOG(INFO, L3FWD, "entering main loop on lcore %u\n", lcore_id);
-	RTE_LOG(INFO, L3FWD, "lcore %u queue range [%d, %d)\n", lcore_id, queue_start, queue_end);
-	RTE_LOG(INFO, L3FWD, "lcore %u tx queue %u\n", lcore_id, tx_queueid);
 	fflush(stdout);
+
+	uint64_t start_time  = rte_rdtsc();
+	uint64_t warmup_time = 3 * rte_get_timer_hz();
+	uint64_t stop_time   = (10 * rte_get_timer_hz()) + warmup_time;
+	// uint64_t stop_time   = (2 * rte_get_timer_hz()) + warmup_time;
 
 	while (!force_quit) {
 
+		cur_tsc = rte_rdtsc();
+
 		/*
-		 * Read packet from RX queues, accumulate into tx_batch, TX once.
+		 * TX burst queue drain
+		 */
+		diff_tsc = cur_tsc - prev_tsc;
+		/* if timer is enabled */
+		if (timer_period > 0) {
+			/* advance the timer */
+			timer_tsc += diff_tsc;
+			/* if timer has reached its timeout */
+			if (unlikely(timer_tsc >= timer_period)) {
+				/* do this only on main core */
+				if (lcore_id == rte_get_main_lcore()) {
+					print_stats();
+					/* reset the timer */
+					timer_tsc = 0;
+				}
+			}
+		}
+		prev_tsc = cur_tsc;
+
+		/*
+		 * Read packet from RX queues
 		 */
 		int max_loops = 100;
-		struct rte_mbuf *tx_batch[TX_BATCH_SIZE];
-		int tx_total = 0;
 
-		for (i = queue_start; i < queue_end; ++i) {
+		for (i = 0; i < queues; ++i) {
 
-			if ((skip > 0) && (queue_hit_local[i] < skip)) {
-				queue_hit_local[i]++;
+			if ((skip > 0) && (queue_hit[i] < skip)) {
+				queue_hit[i]++;
+				// printf("queue %d skip %d\n", i, queue_hit[i]);
 				continue;
 			}
 
-			if (latency_mode && has_latency_queue && inject_queue) {
-				resume_i     = i;
-				i            = latency_queue;
+			if (latency_mode && inject_queue) {
+				resume_i     = i;             // salva dove dovevi andare
+				i            = latency_queue; // inietta la coda specificata
 				inject_queue = false;
 			}
+			// printf("queue %d\n", i);
+			// printf("queue %d skip %d\n", i, queue_hit[i]);
 
-			portid = rx_portid;
-			nb_rx = 0;
-			if (!rte_spinlock_trylock(&rx_queue_locks[portid][i]))
-				continue;
-			nb_rx = rte_eth_rx_burst(portid, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
-			rte_spinlock_unlock(&rx_queue_locks[portid][i]);
+			portid = qconf->rx_queue_list[i].port_id;
+			// queueid = qconf->rx_queue_list[i].queue_id;
+			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
+			n_bursts++;
+			n_pkts += nb_rx;
 
 			if (nb_rx > 0) {
 				struct acl_search_t acl_search;
 
 				prepare_acl_parameter(pkts_burst, &acl_search, nb_rx);
 
-				ret = nf_process_burst(pkts_burst, nb_rx, portid, (uint16_t)i);
+				ret = nf_process_burst(pkts_burst, nb_rx, portid);
 				if (ret == 1) {
 					printf("stopping\n");
-					return 0;
+					end_time = cur_tsc - end_warmup;
+					return 0; // received stop signal
 				}
 
 				if (acl_search.num_ipv4) {
@@ -1733,24 +1894,31 @@ main_loop(__rte_unused void *dummy)
 					                 DEFAULT_MAX_CATEGORIES);
 				}
 
-				if (unlikely(tx_total + nb_rx > TX_BATCH_SIZE)) {
-					uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queueid, tx_batch, tx_total);
-					if (nb_tx < (uint16_t)tx_total) {
-						for (int j = nb_tx; j < tx_total; j++)
-							rte_pktmbuf_free(tx_batch[j]);
-					}
-					tx_total = 0;
+				/* TX ALL pkts_burst (no drop policy). */
+				{
+					uint16_t nb_tx = rte_eth_tx_burst(portid, 0,
+					                                  pkts_burst, (uint16_t)nb_rx);
+					for (int k = nb_tx; k < nb_rx; k++)
+						rte_pktmbuf_free(pkts_burst[k]);
 				}
-				rte_memcpy(&tx_batch[tx_total], pkts_burst,
-				           nb_rx * sizeof(struct rte_mbuf *));
-				tx_total += nb_rx;
-			}
 
-			if (latency_mode && has_latency_queue) {
+
+
+				port_statistics[portid][i].rx += nb_rx;
+				if (after_warmup) {
+					measured_packets_rx += nb_rx;
+				}
+			}
+			if (latency_mode) {
+
+				/* se abbiamo appena fatto una 27 iniettata */
 				if (resume_i != -1 && i == latency_queue) {
-					i        = resume_i - 1;
+					i        = resume_i - 1; // -1 per compensare i++
 					resume_i = -1;
-				} else if (i != latency_queue) {
+				}
+
+				/* conta SOLO le code normali, ESCLUDI la 27 */
+				else if (i != latency_queue) {
 					latency_count++;
 					if (latency_count == latency_period) {
 						latency_count = 0;
@@ -1760,24 +1928,36 @@ main_loop(__rte_unused void *dummy)
 			}
 
 			if (skip > 0 && max_loops == 100)
-				queue_hit_local[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
+				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
-				i--;
+					i--;
 				max_loops--;
 			} else {
 				max_loops = 100;
 			}
-		}
 
-		if (tx_total > 0) {
-			uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queueid, tx_batch, tx_total);
-			if (nb_tx < (uint16_t)tx_total) {
-				for (int j = nb_tx; j < tx_total; j++)
-					rte_pktmbuf_free(tx_batch[j]);
+			if (nb_rx < MAX_PKT_BURST) {
+				spin_time++;
+			}
+			spin_pkt += nb_rx;
+			if (nb_rx == 0) {
+				empty++;
 			}
 		}
+		if ((cur_tsc - start_time) > stop_time) { // 13 seconds) {
+			end_time = cur_tsc - end_warmup;
+			// uncomment below to stop after 13 seconds of measurement
+			// break;
+		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
+			// rte_eth_stats_reset(portid); // skip the first 3 seconds
+			printf("Warmup finished\n");
+			after_warmup = true;
+			end_warmup   = cur_tsc;
+			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
+		}
 	}
+	end_time = rte_rdtsc() - end_warmup;
 	return 0;
 }
 
@@ -1996,7 +2176,7 @@ parse_eth_dest(const char *optarg)
 		return "port value exceeds RTE_MAX_ETHPORTS(" RTE_STR(RTE_MAX_ETHPORTS) ")";
 
 	if (cmdline_parse_etheraddr(
-	        NULL, port_end, &port_l2hdr[portid].d_addr, sizeof(port_l2hdr[portid].d_addr)) < 0)
+	        NULL, port_end, &port_l2hdr[portid].dst_addr, sizeof(port_l2hdr[portid].dst_addr)) < 0)
 		return "Invalid ethernet address";
 	return NULL;
 }
@@ -2109,8 +2289,8 @@ parse_args(int argc, char **argv)
 				struct option lenopts = {"max-pkt-len", required_argument, 0, 0};
 
 				printf("jumbo frame is enabled\n");
-				port_conf.rxmode.offloads |= DEV_RX_OFFLOAD_JUMBO_FRAME;
-				port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MULTI_SEGS;
+				/* DEV_RX_OFFLOAD_JUMBO_FRAME removed in DPDK 22.11; jumbo always enabled */
+				port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
 
 				/*
 				 * if no max-pkt-len set, then use the
@@ -2124,11 +2304,10 @@ parse_args(int argc, char **argv)
 						print_usage(prgname);
 						return -1;
 					}
-					port_conf.rxmode.max_rx_pkt_len = ret;
+					port_conf.rxmode.mtu = ret - RTE_ETHER_HDR_LEN - RTE_ETHER_CRC_LEN;
 				}
-				printf("set jumbo frame max packet length "
-				       "to %u\n",
-				       (unsigned int)port_conf.rxmode.max_rx_pkt_len);
+				printf("set jumbo frame MTU to %u\n",
+				       (unsigned int)port_conf.rxmode.mtu);
 			}
 
 			if (!strncmp(lgopts[option_index].name, OPTION_RULE_IPV4, sizeof(OPTION_RULE_IPV4)))
@@ -2215,7 +2394,7 @@ check_all_ports_link_status(uint32_t port_mask)
 				continue;
 			}
 			/* clear all_ports_up flag if any link down */
-			if (link.link_status == ETH_LINK_DOWN) {
+			if (link.link_status == RTE_ETH_LINK_DOWN) {
 				all_ports_up = 0;
 				break;
 			}
@@ -2247,8 +2426,8 @@ set_default_dest_mac(void)
 	uint32_t i;
 
 	for (i = 0; i != RTE_DIM(port_l2hdr); i++) {
-		port_l2hdr[i].d_addr.addr_bytes[0] = RTE_ETHER_LOCAL_ADMIN_ADDR;
-		port_l2hdr[i].d_addr.addr_bytes[5] = i;
+		port_l2hdr[i].dst_addr.addr_bytes[0] = RTE_ETHER_LOCAL_ADMIN_ADDR;
+		port_l2hdr[i].dst_addr.addr_bytes[5] = i;
 	}
 }
 
@@ -2282,8 +2461,8 @@ create_udp_packet(struct rte_mempool   *mbuf_pool,
 	uint8_t              *payload = (uint8_t *)(udp + 1);
 
 	// --- Ethernet header ---
-	rte_ether_addr_copy(&dst_mac, &eth->d_addr);
-	rte_ether_addr_copy(&src_mac, &eth->s_addr);
+	rte_ether_addr_copy(&dst_mac, &eth->dst_addr);
+	rte_ether_addr_copy(&src_mac, &eth->src_addr);
 	eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
 	// --- IPv4 header ---
@@ -2463,7 +2642,7 @@ main(int argc, char **argv)
 	if (app_acl_init() < 0)
 		rte_exit(EXIT_FAILURE, "app_acl_init failed\n");
 
-	if (!nf_init(queues)) {
+	if (!nf_init()) {
 		printf("Could not initialize NF\n");
 		rte_exit(EXIT_FAILURE, "Error initializing NF");
 	}
@@ -2513,6 +2692,9 @@ main(int argc, char **argv)
 	// 	rte_panic("mempool_populate_default failed\n");
 	// rte_mempool_obj_iter(pktmbuf_pool, rte_pktmbuf_init, NULL);
 
+	for (int i = 0; i < 2048; i++) {
+		queue_hit[i] = skip;
+	}
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)
 	{
@@ -2542,46 +2724,18 @@ main(int argc, char **argv)
 			         portid,
 			         strerror(-ret));
 
-		struct rte_eth_dev *dev = &rte_eth_devices[portid];
-		ret =
-		    rte_eth_dev_configure(portid, (uint16_t)queues, (uint16_t)n_tx_queue, &local_port_conf);
+		local_port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
+		if (local_port_conf.rx_adv_conf.rss_conf.rss_hf != port_conf.rx_adv_conf.rss_conf.rss_hf)
+			printf("Port %u: RSS hash functions adjusted, "
+			       "requested: 0x%" PRIx64 " configured: 0x%" PRIx64 "\n",
+			       portid,
+			       port_conf.rx_adv_conf.rss_conf.rss_hf,
+			       local_port_conf.rx_adv_conf.rss_conf.rss_hf);
+
+		ret = rte_eth_dev_configure(portid, (uint16_t)queues, (uint16_t)1, &local_port_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%d\n", ret, portid);
 
-		// struct qdma_pci_dev *qdma_dev = dev->data->dev_private;
-		uint32_t reg_offst = 0; // timestamp;
-		uint32_t val       = qdma_reg_read_usr(dev, reg_offst);
-		// Timestamp--> QDMA Reg (0x0) Value: 0x0940907F
-		printf("Timestamp--> QDMA Reg (0x%X) Value: 0x%X\n", reg_offst, val);
-		if (val != 0x940907F) {
-			printf("wrong bitstream\n");
-			return 0;
-		}
-
-		struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
-		int                             i, j;
-		// crea l'indir table con valori da 0 a cms_rx_queue_per_lcore
-		for (i = 0; i < dev_info.reta_size / RTE_RETA_GROUP_SIZE; i++) {
-			// select all fields to set //
-			reta_conf[i].mask = ~0LL;
-			for (j = 0; j < RTE_RETA_GROUP_SIZE; j++)
-				// da 0 a number of queues
-				reta_conf[i].reta[j] = 0;
-		}
-		// salva l'indir table sul device
-		ret = rte_eth_dev_rss_reta_update(portid, reta_conf, dev_info.reta_size);
-		if (ret < 0)
-			// stampa errore
-			rte_exit(EXIT_FAILURE, "Cannot set RSS REA: err=%d, port=%u\n", ret, portid);
-
-		rte_eth_dev_rss_reta_query(portid, reta_conf, dev_info.reta_size);
-		printf("pre-queues %u\n", queues);
-		printf("reta-queues %u\n", reta_conf[0].reta[0] + 1);
-		if (queues != reta_conf[0].reta[0] + 1)
-			rte_exit(EXIT_FAILURE,
-			         "Cannot get correct number of queues: %d != %d\n",
-			         queues,
-			         reta_conf[0].reta[0] + 1);
 		printf("cms_rx_queue_per_lcore: %d\n", queues);
 
 		rte_eth_dev_info_get(portid, &dev_info);
@@ -2591,12 +2745,12 @@ main(int argc, char **argv)
 			rte_exit(
 			    EXIT_FAILURE, "rte_eth_dev_adjust_nb_rx_tx_desc: err=%d, port=%d\n", ret, portid);
 
-		ret = rte_eth_macaddr_get(portid, &port_l2hdr[portid].s_addr);
+		ret = rte_eth_macaddr_get(portid, &port_l2hdr[portid].src_addr);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_macaddr_get: err=%d, port=%d\n", ret, portid);
 
-		print_ethaddr("Dst MAC:", &port_l2hdr[portid].d_addr);
-		print_ethaddr(", Src MAC:", &port_l2hdr[portid].s_addr);
+		print_ethaddr("Dst MAC:", &port_l2hdr[portid].dst_addr);
+		print_ethaddr(", Src MAC:", &port_l2hdr[portid].src_addr);
 		printf(", ");
 
 		for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
@@ -2655,40 +2809,21 @@ main(int argc, char **argv)
 		}
 		printf("\n");
 
-		int      diag, x;
-		uint32_t queue_base;
-		diag = rte_pmd_qdma_get_queue_base(portid, &queue_base);
-		if (diag < 0)
-			rte_exit(EXIT_FAILURE,
-			         "rte_pmd_qdma_get_queue_base : Querying of "
-			         "QUEUE_BASE failed\n");
-		// for loop sulle varie code
-		/* init one RX queue */
+		/* init RX queues */
 		fflush(stdout);
 		struct rte_eth_rxconf rxq_conf;
 
 		rxq_conf          = dev_info.default_rxconf;
 		rxq_conf.offloads = local_port_conf.rxmode.offloads;
 
-		for (x = 0; x < queues; x++) {
-			diag = rte_pmd_qdma_set_queue_mode(portid, x, RTE_PMD_QDMA_STREAMING_MODE);
-			if (diag < 0)
+		for (int x = 0; x < queues; x++) {
+			ret = rte_eth_rx_queue_setup(portid, x, nb_rxd,
+			                             rte_eth_dev_socket_id(portid),
+			                             &rxq_conf, pktmbuf_pool[0]);
+			if (ret < 0)
 				rte_exit(EXIT_FAILURE,
-				         "rte_pmd_qdma_set_queue_mode : "
-				         "Passing of STREAMING_MODE "
-				         "failed\n");
-			if (contiguous) {
-				ret = rte_eth_rx_queue_setup(
-				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[x]);
-				if (ret < 0)
-					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
-
-			} else {
-				ret = rte_eth_rx_queue_setup(
-				    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[0]);
-				if (ret < 0)
-					rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
-			}
+				         "rte_eth_rx_queue_setup:err=%d, port=%u\n",
+				         ret, portid);
 		}
 	}
 
@@ -2705,12 +2840,6 @@ main(int argc, char **argv)
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_dev_start: err=%d, port=%d\n", ret, portid);
 
-		/*
-		 * If enabled, put device in promiscuous mode.
-		 * This allows IO forwarding mode to forward packets
-		 * to itself through 2 cross-connected  ports of the
-		 * target machine.
-		 */
 		if (promiscuous_on) {
 			ret = rte_eth_promiscuous_enable(portid);
 			if (ret != 0)
@@ -2721,46 +2850,25 @@ main(int argc, char **argv)
 		}
 	}
 
-	// start - allocate CMS per core
-	RTE_LCORE_FOREACH(lcore_id) {
-		cm_per_core[lcore_id] = rte_zmalloc(NULL, sizeof(struct countmin), 64);
-		cm_per_core[lcore_id]->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
-		for (int i = 0; i < HASHFN_N; i++) {
-			cm_per_core[lcore_id]->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * COLUMNS, 64);
-		}
+	/* initialize port stats */
+	memset(&port_statistics, 0, sizeof(port_statistics));
 
-		for (int i = 0; i < HASHFN_N; i++) {
-			for (int j = 0; j < COLUMNS; j++) {
-				cm_per_core[lcore_id]->values[i][j] = 0;
-			}
+	// start
+	cm         = rte_zmalloc(NULL, sizeof(struct countmin), 64);
+	cm->values = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
+	for (int i = 0; i < HASHFN_N; i++) {
+		cm->values[i] = rte_zmalloc(NULL, sizeof(uint64_t) * COLUMNS, 64);
+	}
+
+	for (int i = 0; i < HASHFN_N; i++) {
+		for (int j = 0; j < COLUMNS; j++) {
+			cm->values[i][j] = 0;
 		}
 	}
-	init_rx_queue_locks();
 	check_all_ports_link_status(enabled_port_mask);
 
-	sleep(3);
-	// rfc
-	RTE_ETH_FOREACH_DEV(portid)
-	{
-		int send_packets = rte_log2_u32(queues) + 1;
-		printf("numero di pacchetti %d\n", send_packets);
-		for (int i = 0; i < send_packets; i++) {
-			// send error packet 0xf00dcafc
-			uint32_t magic_value = 0xf00dcafc;
-			// creazione pacchetto latency
-			struct rte_mbuf *pkt = create_latency_packet(pktmbuf_pool[0], magic_value);
-			// --- Invia pacchetto su porta 0, queue 0 ---
-			uint16_t nb_tx = rte_eth_tx_burst(portid, 0, &pkt, 1);
-			if (nb_tx < 1) {
-				printf("Invio fallito, liberando mbuf\n");
-				rte_pktmbuf_free(pkt);
-				rte_exit(EXIT_FAILURE, "Errore Invio pacchetto clear\n");
-
-			} else {
-				printf("Pacchetto inviato con successo\n");
-			}
-		}
-	}
+	/* NOTE: il blocco "clear packets" era specifico per la pipeline FPGA/QDMA;
+	 * non necessario su Mellanox mlx5. */
 
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
@@ -2770,16 +2878,19 @@ main(int argc, char **argv)
 			return -1;
 	}
 	print_stats();
-	// print_queue_packet_histogram();
+	print_queue_packet_histogram();
 
-	// free countmin per core
-	RTE_LCORE_FOREACH(lcore_id) {
-		for (int i = 0; i < HASHFN_N; i++) {
-			rte_free(cm_per_core[lcore_id]->values[i]);
-		}
-		rte_free(cm_per_core[lcore_id]->values);
-		rte_free(cm_per_core[lcore_id]);
+	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
+	printf("measured RX Throughput: %.2f\n",
+	       (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
+	printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
+
+	// free countmin
+	for (int i = 0; i < HASHFN_N; i++) {
+		rte_free(cm->values[i]);
 	}
+	rte_free(cm->values);
+	rte_free(cm);
 
 	return 0;
 }

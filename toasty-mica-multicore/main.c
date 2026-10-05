@@ -60,6 +60,7 @@ static volatile bool force_quit;
 uint16_t             portid = 0;
 
 #define MAX_PKT_BURST 32
+#define TX_BATCH_SIZE 512
 #define RTE_TEST_RX_DESC_DEFAULT 1024
 #define RTE_TEST_TX_DESC_DEFAULT 1024
 static uint16_t nb_rxd     = RTE_TEST_RX_DESC_DEFAULT;
@@ -128,7 +129,7 @@ static struct rte_eth_conf port_conf = {
 };
 
 
-int queue_hit[2048] = {1};
+/* queue_hit moved to per-lcore stack in main_loop to eliminate false sharing */
 struct mehcached_table  table_o;
 struct mehcached_table *table;
 static void
@@ -403,6 +404,10 @@ main_loop(__rte_unused void *dummy)
 	int  latency_queue  = 27; // coda latency con 64 code totali
 	// int latency_queue = queues -1 ; // ultima coda simulata latency
 
+	/* Per-lcore skip counter — indexed by relative queue index to avoid
+	 * false sharing with adjacent lcores on the global array */
+	int queue_hit_local[MAX_RX_QUEUE_PER_LCORE] __rte_cache_aligned;
+
 	uint16_t       first_queue     = queues;
 	uint16_t       assigned_queues = 0;
 	const uint16_t tx_queue_id     = (uint16_t)lcore_idx;
@@ -421,6 +426,9 @@ main_loop(__rte_unused void *dummy)
 		printf("entering main loop on lcore %u (idle, no RX queues assigned)\n", lcore_id);
 		return 0;
 	}
+
+	for (int qi = 0; qi < assigned_queues; qi++)
+		queue_hit_local[qi] = skip;
 	printf("entering main loop on lcore %u (rx queues [%u, %u), tx queue %u)\n",
 	       lcore_id,
 	       first_queue,
@@ -453,20 +461,23 @@ main_loop(__rte_unused void *dummy)
 		prev_tsc = cur_tsc;
 
 		/*
-		 * Read packet from RX queues
+		 * Read packet from RX queues, accumulate into tx_batch, TX once.
 		 */
 		int max_loops = 100;
+		struct rte_mbuf *tx_batch[TX_BATCH_SIZE];
+		int tx_total = 0;
 
 		for (i = first_queue; i < last_queue; ++i) {
+			int qi = i - first_queue;
 
-			if ((skip > 0) && (queue_hit[i] < skip)) {
-				queue_hit[i]++;
+			if ((skip > 0) && (queue_hit_local[qi] < skip)) {
+				queue_hit_local[qi]++;
 				continue;
 			}
 
 			if (latency_mode && has_latency_queue && inject_queue) {
-				resume_i     = i;             // salva dove dovevi andare
-				i            = latency_queue; // inietta la coda specificata
+				resume_i     = i;
+				i            = latency_queue;
 				inject_queue = false;
 			}
 
@@ -481,19 +492,24 @@ main_loop(__rte_unused void *dummy)
 					break;
 				}
 
-				uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, pkts_burst, nb_rx);
-
-			}
-			if (latency_mode && has_latency_queue) {
-
-				/* se abbiamo appena fatto una 27 iniettata */
-				if (resume_i != -1 && i == latency_queue) {
-					i        = resume_i - 1; // -1 per compensare i++
-					resume_i = -1;
+				if (unlikely(tx_total + nb_rx > TX_BATCH_SIZE)) {
+					uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, tx_batch, tx_total);
+					if (nb_tx < (uint16_t)tx_total) {
+						for (int j = nb_tx; j < tx_total; j++)
+							rte_pktmbuf_free(tx_batch[j]);
+					}
+					tx_total = 0;
 				}
+				rte_memcpy(&tx_batch[tx_total], pkts_burst,
+				           nb_rx * sizeof(struct rte_mbuf *));
+				tx_total += nb_rx;
+			}
 
-				/* conta SOLO le code normali, ESCLUDI la 27 */
-				else if (i != latency_queue) {
+			if (latency_mode && has_latency_queue) {
+				if (resume_i != -1 && i == latency_queue) {
+					i        = resume_i - 1;
+					resume_i = -1;
+				} else if (i != latency_queue) {
 					latency_count++;
 					if (latency_count == latency_period) {
 						latency_count = 0;
@@ -503,13 +519,21 @@ main_loop(__rte_unused void *dummy)
 			}
 
 			if (skip > 0 && max_loops == 100)
-				queue_hit[i] = skip * (nb_rx > MAX_PKT_BURST / 2);
+				queue_hit_local[qi] = skip * (nb_rx > MAX_PKT_BURST / 2);
 
 			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 				i--;
 				max_loops--;
 			} else {
 				max_loops = 100;
+			}
+		}
+
+		if (tx_total > 0) {
+			uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queue_id, tx_batch, tx_total);
+			if (nb_tx < (uint16_t)tx_total) {
+				for (int j = nb_tx; j < tx_total; j++)
+					rte_pktmbuf_free(tx_batch[j]);
 			}
 		}
 	}
@@ -762,7 +786,7 @@ main(int argc, char **argv)
 {
 	uint16_t                   nb_lcores = 0;
 	unsigned                   lcore_id;
-	static struct rte_mempool *mbuf_pool;
+	struct rte_mempool *mbuf_pool_per_lcore[RTE_MAX_LCORE] = {NULL};
 
 	setlocale(LC_NUMERIC, ""); // Usa locale di sistema per i separatori
 
@@ -787,18 +811,7 @@ main(int argc, char **argv)
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No available ports\n");
 
-	/* ---- Mempool ---- */
-	int nb_mbufs = RTE_MAX(
-	    queues * 1 * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
-	mbuf_pool = rte_pktmbuf_pool_create(
-	    "mbuf_pool", nb_mbufs, MEMPOOL_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-
-	if (!mbuf_pool)
-		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
-
-	for (int i = 0; i < 2048; i++) {
-		queue_hit[i] = skip;
-	}
+	for (int i = 0; i < 2048; i++) { (void)i; } /* queue_hit now per-lcore */
 
 	// QueueDPDK setup
 	// Check correct bitstream
@@ -827,6 +840,29 @@ main(int argc, char **argv)
 		         nb_lcores,
 		         queues,
 		         dev_info.max_tx_queues);
+
+	/* ---- Per-lcore mempool ---- */
+	{
+		uint16_t queues_per_lcore = queues / active_io_lcores;
+		uint16_t extra_queues     = queues % active_io_lcores;
+		unsigned lc;
+		uint16_t lc_idx = 0;
+		RTE_LCORE_FOREACH(lc) {
+			if (lc_idx >= active_io_lcores) break;
+			uint16_t lc_queues = queues_per_lcore + (lc_idx < extra_queues ? 1 : 0);
+			uint32_t nb_mbufs  = RTE_MAX(
+			    (uint32_t)(lc_queues * (nb_rxd + MAX_PKT_BURST) + nb_txd + MEMPOOL_CACHE_SIZE),
+			    8192U);
+			char pool_name[32];
+			snprintf(pool_name, sizeof(pool_name), "mbuf_pool_%u", lc);
+			mbuf_pool_per_lcore[lc] = rte_pktmbuf_pool_create(
+			    pool_name, nb_mbufs, MEMPOOL_CACHE_SIZE, 0,
+			    RTE_MBUF_DEFAULT_BUF_SIZE, rte_lcore_to_socket_id(lc));
+			if (!mbuf_pool_per_lcore[lc])
+				rte_exit(EXIT_FAILURE, "Cannot create mbuf pool for lcore %u\n", lc);
+			lc_idx++;
+		}
+	}
 
 	/* Configure port */
 	struct rte_eth_conf port_conf = {0};
@@ -864,6 +900,8 @@ main(int argc, char **argv)
 		struct rte_eth_rxconf rxq_conf = dev_info.default_rxconf;
 		rxq_conf.offloads              = port_conf.rxmode.offloads;
 
+		uint16_t queues_per_lcore = queues / active_io_lcores;
+		uint16_t extra_queues     = queues % active_io_lcores;
 		for (int x = 0; x < queues; x++) {
 			int diag = rte_pmd_qdma_set_queue_mode(portid, x, RTE_PMD_QDMA_STREAMING_MODE);
 			if (diag < 0)
@@ -872,8 +910,24 @@ main(int argc, char **argv)
 				         "Passing of STREAMING_MODE "
 				         "failed\n");
 
+			/* Find which lcore owns this queue */
+			uint16_t owner_lc_idx;
+			uint16_t boundary = extra_queues * (queues_per_lcore + 1);
+			if (x < boundary)
+				owner_lc_idx = (uint16_t)(x / (queues_per_lcore + 1));
+			else
+				owner_lc_idx = (uint16_t)(extra_queues + (x - boundary) / queues_per_lcore);
+
+			unsigned owner_lc = 0;
+			uint16_t tmp_idx  = 0;
+			RTE_LCORE_FOREACH(owner_lc) {
+				if (tmp_idx == owner_lc_idx) break;
+				tmp_idx++;
+			}
+
 			ret = rte_eth_rx_queue_setup(
-			    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, mbuf_pool);
+			    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf,
+			    mbuf_pool_per_lcore[owner_lc]);
 			if (ret < 0)
 				rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
 		}
@@ -907,7 +961,7 @@ main(int argc, char **argv)
 			// send error packet 0xf00dcafc
 			uint32_t magic_value = 0xf00dcafc;
 			// creazione pacchetto latency
-			struct rte_mbuf *pkt = create_latency_packet(mbuf_pool, magic_value);
+			struct rte_mbuf *pkt = create_latency_packet(mbuf_pool_per_lcore[rte_get_main_lcore()], magic_value);
 			// --- Invia pacchetto su porta 0, queue 0 ---
 			uint16_t nb_tx = rte_eth_tx_burst(portid, 0, &pkt, 1);
 			if (nb_tx < 1) {
