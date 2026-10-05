@@ -13,7 +13,7 @@ $(error "no installation of DPDK found")
 endif
 
 #make local for local build using DPDK-20.11 source tree
-all: shared
+all: local
 .PHONY: shared static local
 shared: build/$(APP)-shared
 	ln -sf $(APP)-shared build/$(APP)
