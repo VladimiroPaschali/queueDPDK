@@ -1,0 +1,194 @@
+diff --git a/drivers/net/qdma/qdma.h b/drivers/net/qdma/qdma.h
+index 7ed41ba..d102c43 100644
+--- a/drivers/net/qdma/qdma.h
++++ b/drivers/net/qdma/qdma.h
+@@ -67,7 +67,7 @@
+ #define DEFAULT_TIMER_CNT_TRIG_MODE_TIMER	(5)
+ #define DEFAULT_TIMER_CNT_TRIG_MODE_COUNT_TIMER	(30)
+ 
+-#define MIN_RX_PIDX_UPDATE_THRESHOLD (1)
++#define MIN_RX_PIDX_UPDATE_THRESHOLD (32)
+ #define MIN_TX_PIDX_UPDATE_THRESHOLD (1)
+ #define DEFAULT_MM_CMPT_CNT_THRESHOLD	(2)
+ #define QDMA_TXQ_PIDX_UPDATE_INTERVAL	(1000) //100 uSec
+diff --git a/drivers/net/qdma/qdma_common.c b/drivers/net/qdma/qdma_common.c
+index c9ec47e..c4fa311 100644
+--- a/drivers/net/qdma/qdma_common.c
++++ b/drivers/net/qdma/qdma_common.c
+@@ -206,32 +206,61 @@ int qdma_init_rx_queue(struct qdma_rx_queue *rxq)
+ 				rte_mempool_avail_count(rxq->mb_pool),
+ 				rte_mempool_in_use_count(rxq->mb_pool));
+ #endif //DUMP_MEMPOOL_USAGE_STATS
+-		for (i = 0; i < (rxq->nb_rx_desc - 2); i++) {
+-			if (rte_mempool_get(rxq->mb_pool, &obj) != 0) {
+-				PMD_DRV_LOG(ERR, "qdma-start-rx-queue(): "
+-						"rte_mempool_get: failed");
+-				printf("%s(): %d: qid %d, rte_mempool_get failed\n",
+-				__func__, __LINE__, rxq->queue_id);
+-				goto fail;
+-			}
+-
+-			if (obj != NULL)
+-				mb = obj;
+-			else {
+-				PMD_DRV_LOG(ERR, "%s(): %d: qid %d, rte_mempool_get failed",
+-				__func__, __LINE__, rxq->queue_id);
+-				printf("%s(): %d: qid %d, rte_mempool_get failed\n",
+-				__func__, __LINE__, rxq->queue_id);
+-				goto fail;
+-			}
+-
+-			phys_addr = (uint64_t)mb->buf_iova +
+-				     RTE_PKTMBUF_HEADROOM;
++		// for (i = 0; i < (rxq->nb_rx_desc - 2); i++) {
++			// if (rte_mempool_get(rxq->mb_pool, &obj) != 0) {
++			// 	PMD_DRV_LOG(ERR, "qdma-start-rx-queue(): "
++			// 			"rte_mempool_get: failed");
++			// 	printf("%s(): %d: qid %d, rte_mempool_get failed\n",
++			// 	__func__, __LINE__, rxq->queue_id);
++			// 	goto fail;
++			// }
++
++			// if (obj != NULL)
++			// 	mb = obj;
++			// else {
++			// 	PMD_DRV_LOG(ERR, "%s(): %d: qid %d, rte_mempool_get failed",
++			// 	__func__, __LINE__, rxq->queue_id);
++			// 	printf("%s(): %d: qid %d, rte_mempool_get failed\n",
++			// 	__func__, __LINE__, rxq->queue_id);
++			// 	goto fail;
++			// }
++
++			// phys_addr = (uint64_t)mb->buf_iova +
++			// 	     RTE_PKTMBUF_HEADROOM;
++
++			// mb->data_off = RTE_PKTMBUF_HEADROOM;
++			// rxq->sw_ring[i] = mb;
++			// rx_ring_st[i].dst_addr = phys_addr;
++		// }
++		struct rte_mbuf **mb_ar;
++		uint16_t n = rxq->nb_rx_desc - 1;
++
++		mb_ar = malloc(sizeof(struct rte_mbuf *) * n);
++		if (!mb_ar) {
++			PMD_DRV_LOG(ERR, "malloc failed\n");
++			goto fail;
++		}
++
++		if (rte_mempool_get_bulk(rxq->mb_pool, (void *)mb_ar, n) != 0) {
++			PMD_DRV_LOG(ERR, "%s(): %d: No MBUFS, queue id = %d,"
++				" mbuf_avail_count = %d,"
++				" mbuf_in_use_count = %d, num_desc_req = %d\n",
++				__func__, __LINE__, rxq->queue_id,
++				rte_mempool_avail_count(rxq->mb_pool),
++				rte_mempool_in_use_count(rxq->mb_pool), n);
++			free(mb_ar);
++			goto fail;
++		}
+ 
++		for (i = 0; i < n; i++) {
++			mb = mb_ar[i];
++			phys_addr = (uint64_t)mb->buf_iova + RTE_PKTMBUF_HEADROOM;
+ 			mb->data_off = RTE_PKTMBUF_HEADROOM;
+ 			rxq->sw_ring[i] = mb;
+ 			rx_ring_st[i].dst_addr = phys_addr;
+ 		}
++
++free(mb_ar);
+ #ifdef DUMP_MEMPOOL_USAGE_STATS
+ 		PMD_DRV_LOG(INFO, "%s(): %d: qid %d, mbuf_avail_count = %d,"
+ 				"mbuf_in_use_count = %d",
+diff --git a/drivers/net/qdma/qdma_devops.c b/drivers/net/qdma/qdma_devops.c
+index 83d8c09..98f0233 100644
+--- a/drivers/net/qdma/qdma_devops.c
++++ b/drivers/net/qdma/qdma_devops.c
+@@ -46,6 +46,7 @@
+ #include <string.h>
+ #include <sys/fcntl.h>
+ #include <sys/mman.h>
++#include <sys/types.h>
+ #include <unistd.h>
+ 
+ #include "qdma.h"
+@@ -1296,7 +1297,9 @@ int qdma_dev_configure(struct rte_eth_dev *dev) {
+   // 3 code per ogni porta
+   //  qdma_reg_write_usr(dev,0x1000,0x3);
+   //  qdma_reg_write_usr(dev,0x2000,0x00030003);
+-  qdma_reg_write_usr(dev, 0x1000, 0x1);
++  //set tx queues
++  uint32_t num_tx_queues = dev->data->nb_tx_queues & 0x0000FFFF;
++  qdma_reg_write_usr(dev, 0x1000, num_tx_queues);
+   qdma_reg_write_usr(dev, 0x2000, 0x00010001);
+   // qdma_reg_write_usr(dev, 0x1000, 0x40);
+   // qdma_reg_write_usr(dev, 0x2000, 0x00400040);
+diff --git a/drivers/net/qdma/qdma_rxtx.c b/drivers/net/qdma/qdma_rxtx.c
+index f21ee19..57e5086 100644
+--- a/drivers/net/qdma/qdma_rxtx.c
++++ b/drivers/net/qdma/qdma_rxtx.c
+@@ -526,7 +526,6 @@ static int process_cmpt_ring(struct qdma_rx_queue *rxq,
+ 		}
+ 	}
+ 
+-	// Update the CPMT CIDX
+ 	rxq->cmpt_cidx_info.wrb_cidx = rx_cmpt_tail;
+ 	qdma_dev->hw_access->qdma_queue_cmpt_cidx_update(rxq->dev,
+ 		qdma_dev->is_vf,
+@@ -749,22 +748,42 @@ static uint16_t prepare_packets(struct qdma_rx_queue *rxq,
+ 			struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+ {
+ 	uint16_t count_pkts = 0;
+-	struct rte_mbuf *mb;
+ 	uint16_t pkt_length;
+ 	uint16_t count = 0;
++	uint16_t id = rxq->rx_tail;
++
+ 	while (count < nb_pkts) {
+-		pkt_length = qdma_ul_get_cmpt_pkt_len(
+-					&rxq->cmpt_data[count]);
++		pkt_length = qdma_ul_get_cmpt_pkt_len(&rxq->cmpt_data[count]);
+ 		if (pkt_length) {
+ 			rxq->stats.pkts++;
+ 			rxq->stats.bytes += pkt_length;
+-			mb = prepare_segmented_packet(rxq,
+-					pkt_length, &rxq->rx_tail);
+-			rx_pkts[count_pkts++] = mb;
++
++			if (likely(pkt_length <= rxq->rx_buff_size)) {
++				struct rte_mbuf *mb = rxq->sw_ring[id];
++				rxq->sw_ring[id++] = NULL;
++				if (unlikely(id >= (rxq->nb_rx_desc - 1)))
++					id -= (rxq->nb_rx_desc - 1);
++				rte_mbuf_refcnt_set(mb, 1);
++				mb->nb_segs    = 1;
++				mb->next       = NULL;
++				mb->port       = rxq->port_id;
++				mb->ol_flags   = 0;
++				mb->packet_type = 0;
++				mb->pkt_len    = pkt_length;
++				mb->data_len   = pkt_length;
++				rx_pkts[count_pkts++] = mb;
++			} else {
++				rxq->rx_tail = id;
++				struct rte_mbuf *mb = prepare_segmented_packet(
++						rxq, pkt_length, &rxq->rx_tail);
++				id = rxq->rx_tail;
++				rx_pkts[count_pkts++] = mb;
++			}
+ 		}
+ 		count++;
+ 	}
+ 
++	rxq->rx_tail = id;
+ 	return count_pkts;
+ }
+ 
+@@ -976,6 +995,9 @@ uint16_t qdma_recv_pkts_st(struct qdma_rx_queue *rxq, struct rte_mbuf **rx_pkts,
+ 	PMD_DRV_LOG(DEBUG, " Recv complete with hw pidx :%d\n",
+ 				rxq->wb_status->pidx);
+ 
++	/* Prefetch wb_status so the next poll of this queue finds it warm */
++	rte_prefetch0(rxq->wb_status);
++
+ 	return count_pkts;
+ }
+ 

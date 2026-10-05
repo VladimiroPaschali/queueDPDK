@@ -22,7 +22,12 @@ cd nf-chain && make      # -> nf-chain/build/nf-chain
 cd mica && make          # -> mica/build/mica
 ```
 
-Both build statically against the patched tree in `../../dpdk-20.11` (override with `DPDK_LOCAL_PATH=`).
+Both build statically against the patched tree in `../../dpdk-20.11` (override with `DPDK_LOCAL_PATH=`). That tree is DPDK 20.11 with the Open-NIC QDMA driver plus two patches, applied in order from the DPDK root:
+
+```
+patch -p1 < dpdk-20.11-drivers.patch       # QDMA PMD with user-register access and the 2048-queue RETA
+patch -p1 < dpdk-20.11-qdma-tuning.patch   # multiple TX queues, more descriptors, RX PIDX update every 32 packets
+```
 
 ## Policies
 
