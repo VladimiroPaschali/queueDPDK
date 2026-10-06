@@ -497,11 +497,15 @@ poll_loop(const enum qflow_mode mode)
 				}
 			}
 
+			/* Penalty and Aggressive act on regular polls only: after a latency
+			 * poll i already points back into the sweep */
+			bool latency_poll = false;
 			if (latency_mode && has_latency_queue) {
 				/* back to the regular sweep after a latency poll */
 				if (resume_i != -1 && i == latency_queue) {
-					i        = resume_i - 1; // -1 per compensare i++
-					resume_i = -1;
+					i            = resume_i - 1; // -1 per compensare i++
+					resume_i     = -1;
+					latency_poll = true;
 				}
 				/* count only regular queues */
 				else if (i != latency_queue) {
@@ -513,14 +517,16 @@ poll_loop(const enum qflow_mode mode)
 				}
 			}
 
-			if (penalty > 0 && max_loops == QFLOW_MAX_CONSECUTIVE_POLLS)
-				hit[mode == QFLOW_PARTITIONED ? qi : i] = penalty * (nb_rx > MAX_PKT_BURST / 2);
+			if (!latency_poll) {
+				if (penalty > 0 && max_loops == QFLOW_MAX_CONSECUTIVE_POLLS)
+					hit[mode == QFLOW_PARTITIONED ? qi : i] = penalty * (nb_rx > MAX_PKT_BURST / 2);
 
-			if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
-				i--;
-				max_loops--;
-			} else {
-				max_loops = QFLOW_MAX_CONSECUTIVE_POLLS;
+				if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
+					i--;
+					max_loops--;
+				} else {
+					max_loops = QFLOW_MAX_CONSECUTIVE_POLLS;
+				}
 			}
 
 			if (mode == QFLOW_SINGLE) {

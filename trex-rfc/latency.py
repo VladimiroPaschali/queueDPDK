@@ -350,10 +350,11 @@ def main():
     parser.add_argument("--duration", type=float, default=5.0, help="seconds per sample")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--rediscover", action="store_true", help="ignore latency_queues.json")
+    parser.add_argument("--output", help="results directory (default results_latency_nf-chain_skew<skew>)")
     args = parser.parse_args()
 
     rates = rate_range(args.min, args.max, args.step)
-    results_dir = os.path.join(HERE, f"results_latency_nf-chain_skew{args.skew}")
+    results_dir = os.path.join(HERE, args.output or f"results_latency_nf-chain_skew{args.skew}")
     os.makedirs(results_dir, exist_ok=True)
     results_csv = os.path.join(results_dir, "latency_results.csv")
     summary_csv = os.path.join(results_dir, "latency_summary.csv")
