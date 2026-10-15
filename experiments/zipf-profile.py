@@ -68,6 +68,13 @@ class ZipfProfile(object):
         self.num_flows = kwargs.get('num_flows', 10000)
         self.skew = kwargs.get('skew', 0.6)
         self.packet_size = kwargs.get('packet_size', 64)
+        # TRex starts every stream at the same instant, so the first packet of
+        # every flow leaves at once: a burst of num_flows packets that one RX
+        # ring cannot hold. start_spread_us > 0 delays each stream by a random
+        # time in [0, start_spread_us) (default 0: the traffic of the campaigns)
+        start_spread_us = kwargs.get('start_spread_us', 0)
+        isg = (np.random.RandomState(1).uniform(0, start_spread_us, size=self.num_flows)
+               if start_spread_us > 0 else np.zeros(self.num_flows))
         
         print(f"\n[ZipfProfile PPS] Configurazione:")
         print(f"  • Numero flussi: {self.num_flows:,}")
@@ -112,6 +119,7 @@ class ZipfProfile(object):
             
             stream = STLStream(
                 packet=STLPktBuilder(pkt=pkt),
+                isg=float(isg[flow_idx]),
                 mode=STLTXCont(pps=flow_pps)
             )
             
