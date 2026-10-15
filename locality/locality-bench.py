@@ -35,7 +35,7 @@ from trex.stl.api import STLClient, STLProfile
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-PROFILE_FILE  = os.path.join(os.path.dirname(__file__), "../trex-rfc/zipf-profile.py")
+PROFILE_FILE  = os.path.join(os.path.dirname(__file__), "../experiments/zipf-profile.py")
 DPDK_BASE_CMD = (
     "sudo /home/vladimiro/dpdk_patched/queueDPDK/locality/build/cms"
     " -d librte_net_qdma.so -l 4 -n 4 -a 16:00.1 --"
