@@ -2,15 +2,21 @@
 Plots for the latency campaign of latency.py.
 
   python3 plot_latency.py                                   # default results directory
-  python3 plot_latency.py results_latency_nf-chain_skew0.9 --metric p50 --rate 1.5
+  python3 plot_latency.py results/latency/results_latency_nf-chain_skew0.9 --metric p50 --rate 1.5
 
-Writes PDF and PNG into <results>/plots/:
+Writes PDF and PNG into plots/latency/ (--out):
   latency_vs_rate_<metric>      one panel per queue count, latency vs offered rate
   latency_vs_queues_<metric>_<rate>Mpps
                                 latency vs number of queues at one offered rate
   latency_vs_queues_grid_<metric>
                                 the same, one panel per rate (--panel-rates)
   zero_loss_rate                highest offered rate without loss vs number of queues
+  pareto_<metric>               throughput against latency, one panel per policy:
+                                every queue count at its highest zero-loss rate,
+                                with the Pareto frontier (counts that no other
+                                count beats on both axes); dominated counts hollow
+  pareto_all_<metric>           every policy together, frontier over all of them
+                                (pareto for metric p99 and max, from latency_summary.csv)
 
 Points that are not zero-loss (loss > 0.1%) are drawn with hollow markers and
 dashed segments: their latency includes queueing from an overloaded core.
@@ -41,6 +47,7 @@ POLICIES = {
 INK = "#0b0b0b"
 INK_2 = "#52514e"
 GRID = "#e4e3df"
+PARETO_METRICS = {"p99": "p99 latency (µs)", "max": "max latency (µs)"}
 
 plt.rcParams.update({
     "font.size": 9,
@@ -277,10 +284,113 @@ def plot_zero_loss(rows, out_dir):
     save(fig, out_dir, "zero_loss_rate")
 
 
+def load_pareto(path):
+    """{policy: {queues: (rate Mpps, {metric: µs})}} at the highest zero-loss rate."""
+    best = {}
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            if r["zero_loss"] != "True":
+                continue
+            key = (r["policy"], int(r["queues"]))
+            rate = float(r["rate_mpps"])
+            if key not in best or rate > best[key][0]:
+                best[key] = (rate, {m: float(r[f"{m}_mean"]) for m in PARETO_METRICS})
+    out = {}
+    for (p, q), v in best.items():
+        out.setdefault(p, {})[q] = v
+    return out
+
+
+def frontier(points):
+    """Points (rate, latency, tag) not dominated by another one, by rate."""
+    pts = sorted(points, key=lambda x: (-x[0], x[1]))
+    front, low = [], float("inf")
+    for p in pts:
+        if p[1] < low:
+            front.append(p)
+            low = p[1]
+    return sorted(front)
+
+
+def place_labels(ax, labels):
+    """Annotate (x, y, text, color) next to each point: right above, right below,
+    left above, left below, then further away, taking the first spot that does
+    not overlap a label already placed (display coordinates)."""
+    ax.figure.canvas.draw()
+    placed = []
+    for x, y, text, color in sorted(labels, key=lambda l: (-l[1], l[0])):
+        px, py = ax.transData.transform((x, y))
+        w, h = 4.0 * len(text) + 4, 8
+        spots = [(4, 3), (4, -10), (-4 - w, 3), (-4 - w, -10), (4, 12), (4, -19), (-4 - w, 12), (-4 - w, -19)]
+        for dx, dy in spots:
+            box = (px + dx, py + dy, px + dx + w, py + dy + h)
+            if not any(box[0] < q[2] and q[0] < box[2] and box[1] < q[3] and q[1] < box[3] for q in placed):
+                break
+        placed.append(box)
+        ax.annotate(text, (x, y), xytext=(dx, dy), textcoords="offset points", fontsize=6.5, color=color)
+
+
+def plot_pareto(data, metric, title, out):
+    policies = [p for p in POLICIES if p in data]
+    fig, axes = plt.subplots(1, len(policies), figsize=(3.3 * len(policies), 3.0), sharey=True, squeeze=False)
+    for ax, policy in zip(axes[0], policies):
+        style = POLICIES[policy]
+        pts = [(rate, lat[metric], q) for q, (rate, lat) in data[policy].items()]
+        front = frontier(pts)
+        labels = []
+        on = {p[2] for p in front}
+        ax.step([p[0] for p in front], [p[1] for p in front], where="post", color=style["color"], lw=1.2,
+                alpha=0.7)
+        for rate, lat, q in pts:
+            ax.plot(rate, lat, marker=style["marker"], ms=6, ls="none", color=style["color"],
+                    mfc=style["color"] if q in on else "white", mec=style["color"], mew=1.2, zorder=3)
+            labels.append((rate, lat, f"{q}q", INK if q in on else INK_2))
+        ax.set_title(policy)
+        ax.set_yscale("log")
+        ax.set_xlabel("zero-loss throughput (Mpps)")
+        place_labels(ax, labels)
+    axes[0][0].set_ylabel(PARETO_METRICS[metric])
+    handles = [plt.Line2D([], [], marker="o", ls="none", color=INK_2, mfc=INK_2, label="Pareto frontier"),
+               plt.Line2D([], [], marker="o", ls="none", color=INK_2, mfc="white", label="dominated")]
+    fig.legend(handles=handles, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02), fontsize=8)
+    fig.suptitle(title, y=1.08, fontsize=9, color=INK)
+    fig.tight_layout()
+    save(fig, out, f"pareto_{metric}")
+
+
+def plot_pareto_all(data, metric, title, out):
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    pts = []
+    for policy in [p for p in POLICIES if p in data]:
+        style = POLICIES[policy]
+        for q, (rate, lat) in data[policy].items():
+            pts.append((rate, lat[metric], (policy, q)))
+            ax.plot(rate, lat[metric], marker=style["marker"], ms=5, ls="none", color=style["color"],
+                    mfc="white", mew=1.0, alpha=0.8)
+    front = frontier(pts)
+    ax.step([p[0] for p in front], [p[1] for p in front], where="post", color=INK, lw=1.2, zorder=2)
+    for rate, lat, (policy, q) in front:
+        style = POLICIES[policy]
+        ax.plot(rate, lat, marker=style["marker"], ms=7, ls="none", color=style["color"], zorder=3)
+    ax.set_yscale("log")
+    ax.set_xlabel("zero-loss throughput (Mpps)")
+    ax.set_ylabel(PARETO_METRICS[metric])
+    handles = [plt.Line2D([], [], marker=s["marker"], ls="none", color=s["color"], label=p)
+               for p, s in POLICIES.items() if p in data]
+    handles.append(plt.Line2D([], [], color=INK, lw=1.2, label="Pareto frontier (filled)"))
+    ax.legend(handles=handles, fontsize=7, loc="upper left")
+    ax.set_title(title)
+    fig.tight_layout()
+    place_labels(ax, [(rate, lat, f"{policy}, {q}q", INK) for rate, lat, (policy, q) in front])
+    save(fig, out, f"pareto_all_{metric}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("results", nargs="?", default="results_latency_nf-chain_skew0.6",
+    parser.add_argument("results", nargs="?",
+                        default=os.path.join(HERE, "results", "latency", "results_latency_nf-chain_skew0.6"),
                         help="results directory written by latency.py")
+    parser.add_argument("--out", default=os.path.join(HERE, "plots", "latency"))
     parser.add_argument("--metric", default="p99", choices=["p50", "p90", "p95", "p99"])
     parser.add_argument("--rate", type=float, default=2.0,
                         help="offered rate (Mpps) for latency_vs_queues")
@@ -291,7 +401,7 @@ def main():
 
     results = args.results if os.path.isabs(args.results) else os.path.join(HERE, args.results)
     rows = load(os.path.join(results, "latency_results.csv"))
-    out_dir = os.path.join(results, "plots")
+    out_dir = args.out
     os.makedirs(out_dir, exist_ok=True)
     print(f"{len(rows)} points from {results}")
 
@@ -299,6 +409,15 @@ def main():
     plot_vs_queues(rows, args.metric, args.rate, out_dir)
     plot_vs_queues_grid(rows, args.metric, args.panel_rates, out_dir)
     plot_zero_loss(rows, out_dir)
+    pareto = load_pareto(os.path.join(results, "latency_summary.csv"))
+    skew = os.path.basename(os.path.normpath(results)).rsplit("skew", 1)[-1]
+    for metric in PARETO_METRICS:
+        title = f"nf-chain, skew {skew}: throughput against {metric} latency per queue count"
+        plot_pareto(pareto, metric, title, out_dir)
+        plot_pareto_all(pareto, metric, title, out_dir)
+    for policy, by_q in pareto.items():
+        front = frontier([(rate, lat["p99"], q) for q, (rate, lat) in by_q.items()])
+        print(f"{policy:20} p99 frontier: " + ", ".join(f"{q}q {r:.1f} Mpps {l:.0f} µs" for r, l, q in front))
     print(f"Plots in {out_dir}/")
 
 
