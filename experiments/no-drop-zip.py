@@ -69,13 +69,12 @@ def _get_empty_poll(dpdk_output) -> int:
     )
 
     if matches:
-        last_10 = [float(m) for m in matches[-10:-2]]
-        empty_poll = sum(last_10) / len(last_10)
+        samples = [float(m) for m in matches[1:-1]] or [float(m) for m in matches]
+        empty_poll = sum(samples) / len(samples)
         # print("Empty poll (ultimi 10):", last_10)
         # print("Empty poll (media):", empty_poll)
     else:
-        empty_poll = -1
-        print("Empty poll not found")
+        empty_poll = ''  # multicore prints no per-second stats
 
     return empty_poll
 
@@ -88,13 +87,10 @@ def _get_packet_per_burst(dpdk_output) -> int:
     )
 
     if matches:
-        last_10 = [float(m) for m in matches[-10:-2]]
-        packet_per_burst = sum(last_10) / len(last_10)
-        print("Packets per burst (ultimi 10):", last_10)
-        print("Packets per burst (media):", packet_per_burst)
+        samples = [float(m) for m in matches[1:-1]] or [float(m) for m in matches]
+        packet_per_burst = sum(samples) / len(samples)
     else:
-        packet_per_burst = -1
-        print("Packets per burst not found")    
+        packet_per_burst = ''
     return packet_per_burst
 
 def _get_all_pkts(dpdk_output) -> int:
@@ -119,33 +115,83 @@ def _extract_cores(base_command):
 def policy_args(policy):
     return f"--policy {policy}"
 
-def launch_program_with_perf(base_command, queue, policy, perf_events, final_pps):
-    perf_events_str = ','.join(perf_events)
-    perf_timeout = 20  
+# Steady-state perf windows, taken after the NDR search on the same process
+# while TRex sends at the NDR rate. Events are split so the first window
+# (cycles, instructions, L1) is never multiplexed; the second one is, and perf
+# scales it. The IMC CAS counters run system-wide alongside the second window.
+PERF_WARMUP = 3
+PERF_WINDOWS = [
+    (8, ['cycles', 'instructions', 'L1-dcache-loads', 'L1-dcache-load-misses',
+         'L1-dcache-stores', 'branches', 'branch-misses']),
+    (12, ['l2_request.all', 'l2_request.miss', 'mem_load_l3_miss_retired.local_dram',
+          'dTLB-loads', 'dTLB-load-misses', 'LLC-loads', 'LLC-load-misses',
+          'cache-references', 'cache-misses', 'LLC-stores', 'LLC-store-misses']),
+]
+IMC_EVENTS = ['uncore_imc/cas_count_read/', 'uncore_imc/cas_count_write/']
+PERF_EVENTS = [e for _, events in PERF_WINDOWS for e in events]
+# per-packet columns written to the CSV (perf events, DRAM bytes, app counters)
+METRICS = ([e.replace('-', '_').replace('.', '_') for e in PERF_EVENTS]
+           + ['dram_read_bytes', 'dram_write_bytes', 'perf_tx_pps', 'perf_loss_pct'])
 
+
+def _parse_perf_csv(text):
+    """perf stat -x, lines: value,unit,event,runtime,pct,..."""
+    out = {}
+    for line in text.splitlines():
+        f = line.split(',')
+        if len(f) < 3 or not f[0] or f[0].startswith('<'):
+            continue
+        try:
+            value = float(f[0])
+        except ValueError:
+            continue
+        if f[1] == 'MiB':
+            value *= 1 << 20
+        out[f[2]] = value
+    return out
+
+
+def _port_counters(client):
+    st = client.get_stats(ports=PORTS)[0]
+    return st['opackets'], st['ipackets']
+
+
+def measure_steady_state(client, process, base_command, pps, core_mask=None):
+    """Per-packet perf events on the running app, with TRex at @pps."""
     cores = _extract_cores(base_command)
-
-    perf_prefix = f'sudo perf stat -C {cores} -e {perf_events_str} --timeout {perf_timeout * 1000}'
-    command = f'{perf_prefix} {base_command} -q {queue} {policy_args(policy)}'
-
-    try:
-        result = sp.run(shlex.split(command), capture_output=True, text=True, check=True)
-    except sp.CalledProcessError as e:
-        tqdm.write("Error running perf command:" + str(e))
-        return {}
-    
-    perf_data = _parse_perf_output(result.stderr)
-    all_pkts = _get_all_pkts(result.stdout)
-    throughput = _get_dpdk_throughput(result.stdout)
-
-    if all_pkts <= 0:
-        tqdm.write("⚠️ All packets count normalizing with last trex throughput.")
-        perf_data = {k: v / final_pps * perf_timeout for k, v in perf_data.items()}
-    else:
-        perf_data = {k: v / all_pkts for k, v in perf_data.items()}
-
-    return perf_data
-
+    launch_trex(client, pps, core_mask)
+    sleep(PERF_WARMUP)
+    out_mark = len(process._output)
+    metrics = {}
+    tx_total = rx_total = 0
+    for i, (seconds, events) in enumerate(PERF_WINDOWS):
+        cmd = ['sudo', 'perf', 'stat', '-x,', '-C', cores, '-e', ','.join(events), 'sleep', str(seconds)]
+        imc = None
+        if i == len(PERF_WINDOWS) - 1:
+            imc = sp.Popen(['sudo', 'perf', 'stat', '-x,', '-a', '-e', ','.join(IMC_EVENTS),
+                            'sleep', str(seconds)], stdout=sp.DEVNULL, stderr=sp.PIPE, text=True)
+        tx0, rx0 = _port_counters(client)
+        res = sp.run(cmd, capture_output=True, text=True)
+        imc_out = imc.communicate()[1] if imc else ''
+        tx1, rx1 = _port_counters(client)
+        tx, rx = tx1 - tx0, rx1 - rx0
+        tx_total += tx
+        rx_total += rx
+        counts = _parse_perf_csv(res.stderr)
+        for event in events:
+            if event in counts and tx > 0:
+                metrics[event.replace('-', '_').replace('.', '_')] = counts[event] / tx
+        if imc:
+            imc_counts = _parse_perf_csv(imc_out)
+            if tx > 0:
+                metrics['dram_read_bytes'] = imc_counts.get(IMC_EVENTS[0], 0) / tx
+                metrics['dram_write_bytes'] = imc_counts.get(IMC_EVENTS[1], 0) / tx
+    seconds = sum(s for s, _ in PERF_WINDOWS)
+    metrics['perf_tx_pps'] = tx_total / seconds
+    metrics['perf_loss_pct'] = 100 * (tx_total - rx_total) / tx_total if tx_total else ''
+    stop_trex(client)
+    window_output = process._output[out_mark:]
+    return metrics, _get_empty_poll(window_output), _get_packet_per_burst(window_output)
 
 
 def launch_program(base_command, queue, policy, additional_args):
@@ -192,14 +238,12 @@ def launch_program(base_command, queue, policy, additional_args):
 def stop_program(process):
     if process and process != -1:
         process.terminate()   # tenta chiusura "soft"
-        process.wait()
-        
-        empty_poll = _get_empty_poll(process._output)
-        packet_per_burst = _get_packet_per_burst(process._output)
-        
+        try:
+            process.wait(timeout=60)
+        except sp.TimeoutExpired:
+            sp.run(['sudo', 'pkill', '-9', '-f', 'build/(nf-chain|mica)'])
+            process.wait()
         tqdm.write("Program terminated.")
-        return empty_poll, packet_per_burst
-    return None, None
 
 
 def extract_final_pps(bench, policy, queue, repetition):
@@ -230,7 +274,7 @@ def extract_final_pps(bench, policy, queue, repetition):
         return None
 
 
-def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_events, empty_poll=None, packet_per_burst=None, csv_file="benchmark_results.csv"):
+def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, metric_names, empty_poll=None, packet_per_burst=None, csv_file="benchmark_results.csv"):
     """Esporta i risultati di una iterazione (con metriche perf) in CSV strutturato"""
     try:
         results_json = bench.results.to_json()
@@ -270,9 +314,8 @@ def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_e
         }
         
         # Aggiungi metriche perf dinamicamente
-        for event in perf_events:
-            col_name = event.replace('-', '_').replace('.', '_')
-            row_data[col_name] = perf_metrics.get(event, '')
+        for col_name in metric_names:
+            row_data[col_name] = perf_metrics.get(col_name, '')
         
         # Scrivi header se il file non esiste
         file_exists = os.path.isfile(csv_file)
@@ -287,7 +330,7 @@ def export_results_to_csv(bench, policy, queue, repetition, perf_metrics, perf_e
         tqdm.write(f"❌ Errore nell'esportazione CSV: {e}")
 
 
-def calculate_and_export_averages(perf_events, csv_file="benchmark_results.csv", averages_csv="benchmark_averages.csv"):
+def calculate_and_export_averages(metric_names, csv_file="benchmark_results.csv", averages_csv="benchmark_averages.csv"):
     """Calcola le medie per ogni gruppo di ripetizioni (policy, queue) e le esporta in un CSV separato"""
     try:
         if not os.path.isfile(csv_file):
@@ -324,8 +367,7 @@ def calculate_and_export_averages(perf_events, csv_file="benchmark_results.csv",
         ]
         
         # Aggiungi i campi perf dinamicamente
-        for event in perf_events:
-            numeric_fields.append(event.replace('-', '_').replace('.', '_'))
+        numeric_fields += list(metric_names) + ['empty_poll', 'packet_per_burst']
         
         for (policy, queue), group_rows in sorted(groups.items()):
             avg_row = {'policy': policy, 'queue': queue, 'repetitions_count': len(group_rows)}
@@ -335,8 +377,9 @@ def calculate_and_export_averages(perf_events, csv_file="benchmark_results.csv",
                 values = []
                 for row in group_rows:
                     try:
-                        val = float(row.get(field, 0)) if row.get(field) else 0
-                        values.append(val)
+                        if row.get(field) in (None, ''):
+                            continue
+                        values.append(float(row[field]))
                     except (ValueError, TypeError):
                         pass
                 
@@ -375,12 +418,12 @@ def calculate_and_export_averages(perf_events, csv_file="benchmark_results.csv",
     except Exception as e:
         tqdm.write(f"❌ Errore nel calcolo delle medie: {e}")
 
-def launch_trex(client, pps):
-    client.start(ports=PORTS, mult=f"{pps}pps", force=True)
+def launch_trex(client, pps, core_mask=None):
+    client.start(ports=PORTS, mult=f"{pps}pps", force=True, core_mask=core_mask)
     # aspetta wamup traffico a pps
     tqdm.write("Waiting for traffic to reach expected rate before stopping warmup...")
 
-    while True:
+    for _ in range(30):
         stats = client.get_stats(ports=[0])
         current_pps = stats[0]['tx_pps']
         if current_pps >= int(pps) * 0.9:  # check if traffic is at least 90% of expected
@@ -393,7 +436,7 @@ def launch_trex(client, pps):
 def stop_trex(client):
     tqdm.write("Stopping TRex traffic...")
     client.stop(ports=PORTS)
-    while True:
+    for _ in range(30):
         stats = client.get_stats(ports=PORTS)
         if stats[0]['tx_pps'] < 2:
             break
@@ -413,6 +456,17 @@ def release_trex(client):
         client.reset(ports=PORTS)
     finally:
         client.disconnect()
+
+# above pdr (0.1%) with margin: the binary search never found a lossless rate
+NDR_FAILED_DROP_PCT = 0.2
+
+
+def ndr_failed(row):
+    try:
+        return float(row['drop_rate_percentage']) > NDR_FAILED_DROP_PCT
+    except (KeyError, ValueError):
+        return True
+
 
 def clear_csv_files():
     """Rimuove i file CSV esistenti per risultati e medie"""
@@ -436,7 +490,21 @@ def set_governor(governor):
         except sp.CalledProcessError:
             print(f"Core {core}: errore")
 
+BOOST = "/sys/devices/system/cpu/cpufreq/boost"
+
+
+def set_boost(value):
+    """Turbo off during the runs (fixed 3.1 GHz as in the paper); returns the old value."""
+    try:
+        with open(BOOST) as f:
+            old = f.read().strip()
+    except OSError:
+        return None
+    sp.run(["sudo", "tee", BOOST], input=str(value), text=True, stdout=sp.DEVNULL, check=False)
+    return old
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS_NDR = os.path.join(REPO, "experiments", "results", "ndr")  # results_<experiment>_skew<s>/
 QDMA_EAL = "-d librte_net_qdma.so -n 4 -a 0000:16:00.1"
 NF_CHAIN = (f"sudo {REPO}/nf-chain/build/nf-chain {QDMA_EAL} -l {{lcores}} -- -p 0x3 "
             f"--config=\"(0,0,0),(0,1,1)\" "
@@ -485,31 +553,42 @@ for cores, lcores in ((2, "0,1"), (4, "0-3"), (8, "0-7")):
         }
 
 
+# Do the packet buffers of many queues push MICA's items out of the LLC? The same
+# aggressive points with 256-descriptor rings (a quarter of the buffers)
+EXPERIMENTS['mica-ring256'] = dict(EXPERIMENTS['mica'], policies=["aggressive"], queues=[64, 512],
+                                   repetitions=2, zipf_skews=[0.6], additional_args="-d 256")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Zero-loss throughput (RFC2544 NDR) with TRex")
     parser.add_argument("experiments", nargs="*", help="experiments to run: " + ", ".join(EXPERIMENTS))
+    parser.add_argument("--resume", action="store_true",
+                        help="keep existing CSVs and skip the (policy, queue, repetition) already in them")
+    parser.add_argument("--queues", type=int, nargs="+", help="override the queue counts of the experiments")
+    parser.add_argument("--policies", nargs="+", help="override the policies of the experiments")
+    parser.add_argument("--skews", type=float, nargs="+", help="override the Zipf skews of the experiments")
+    parser.add_argument("--repetitions", type=int, help="override the repetitions of the experiments")
+    parser.add_argument("--tag", default="", help="suffix of the results folders, results/ndr/results_<experiment><tag>_skew*")
     args = parser.parse_args()
     unknown = [e for e in args.experiments if e not in EXPERIMENTS]
     if not args.experiments or unknown:
         parser.error(f"choose from: {', '.join(EXPERIMENTS)}")
-    commands_config = {name: EXPERIMENTS[name] for name in args.experiments}
+    commands_config = {name: dict(EXPERIMENTS[name]) for name in args.experiments}
+    for config in commands_config.values():
+        for key, value in (('queues', args.queues), ('policies', args.policies),
+                           ('zipf_skews', args.skews), ('repetitions', args.repetitions)):
+            if value is not None:
+                config[key] = value
 
     client = STLClient(server="100.78.72.16")
+    old_boost = None
 
-    # Eventi perf da raccogliere
-    perf_events = [
-        'cycles', 'instructions', 'cache-references', 'cache-misses',
-        'L1-dcache-loads', 'L1-dcache-load-misses', 'L1-dcache-stores',
-        'l2_request.miss', 'l2_request.all', 'dTLB-loads', 'dTLB-load-misses',
-        'LLC-loads', 'LLC-load-misses', 'LLC-stores', 'LLC-stores-misses',
-        'mem_load_l3_miss_retired.local_dram'
-    ]
-    
     try:
         tqdm.write("Connessione a TRex...")
         client.connect()
 
         set_governor("performance")
+        old_boost = set_boost(0)
         
         # Calcola il numero totale di iterazioni
         total_iterations = sum(
@@ -528,6 +607,8 @@ def main():
             repetitions = cmd_config['repetitions']
             zipf_skews = cmd_config['zipf_skews']
             additional_args = cmd_config.get('additional_args', '')
+            profile_file = cmd_config.get('profile', PROFILE_FILE)
+            core_mask = cmd_config.get('trex_core_mask')
 
             for zipf_skew in zipf_skews:
                 tqdm.write(f"\n{'='*80}")
@@ -535,16 +616,30 @@ def main():
                 tqdm.write(f"{'='*80}\n")
                 
                 # Crea cartella per i risultati
-                results_dir = f"results_{cmd_name}_skew{zipf_skew}"
+                results_dir = os.path.join(RESULTS_NDR, f"results_{cmd_name}{args.tag}_skew{zipf_skew}")
                 os.makedirs(results_dir, exist_ok=True)
                 
                 # Percorsi CSV nella cartella di risultati
                 csv_file = os.path.join(results_dir, "benchmark_results.csv")
                 averages_csv = os.path.join(results_dir, "benchmark_averages.csv")
                 
-                # Azzera il CSV se esiste
+                # Azzera il CSV se esiste, o con --resume salta i test già fatti
+                done = set()
                 if os.path.isfile(csv_file):
-                    os.remove(csv_file)
+                    if args.resume:
+                        # le ricerche NDR fallite (app che non inoltra) si ripetono
+                        with open(csv_file, newline='') as f:
+                            reader = csv.DictReader(f)
+                            fields, rows = reader.fieldnames, list(reader)
+                        good = [r for r in rows if not ndr_failed(r)]
+                        if len(good) < len(rows):
+                            with open(csv_file, 'w', newline='') as f:
+                                writer = csv.DictWriter(f, fieldnames=fields)
+                                writer.writeheader()
+                                writer.writerows(good)
+                        done = {(r['policy'], int(r['queue']), int(r['repetition'])) for r in good}
+                    else:
+                        os.remove(csv_file)
                 
                 tqdm.write(f"Reset porta 0...")
 
@@ -552,13 +647,13 @@ def main():
                 
                 tqdm.write(f"Carico stream da profilo Zipf {zipf_skew} Python...")
                 streams = STLProfile.load_py(
-                    PROFILE_FILE,
+                    profile_file,
                     direction=0,
                     port_id=0,
                     num_flows=10000,
                     # num_flows=1,
                     skew=zipf_skew,
-                    packet_size=64
+                    packet_size=64,
                 ).get_streams()
                 
                 tqdm.write(f"✅ Caricati {len(streams):,} stream dal profilo Zipf\n")
@@ -580,41 +675,60 @@ def main():
                     plugin_file="ndr_plugin_stats.py",
                 )
                 config.receive_ports = [0]
+                if core_mask is not None:
+                    config.transmit_core_masks = core_mask
                 
                 tqdm.write(f"🚀 Avvio benchmark NDR (zero packet loss)...\n")
 
                 for policy in policies:
-                    for queue in queues:                
+                    for queue in queues:
                         for repetition in range(repetitions):
                             pbar.set_description(f"[{cmd_name:12} |skew:{zipf_skew:.2f}| Q:{queue:4d} | {policy:12} | Rep:{repetition+1}/{repetitions}]")
-                            
-                            bench = NdrBench(client, config)
+                            if (policy, queue, repetition + 1) in done:
+                                pbar.update(1)
+                                continue
+
                             process = launch_program(base_command, queue, policy, additional_args)
-                            bench.find_ndr()
-                            empty_poll, packet_per_burst = stop_program(process)
-                            
-                            # Estrai final_pps dai risultati del benchmark
-                            final_pps = extract_final_pps(bench, policy, queue, repetition+1)
-                            
-                            if final_pps:
-                                # Esegui perf per ottenere le metriche
-                                launch_trex(client, final_pps)
-                                perf_metrics = launch_program_with_perf(base_command, queue, policy, perf_events, final_pps)
-                                stop_trex(client)
-                                # Esporta risultati benchmark + metriche perf in CSV
-                                export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, perf_events, empty_poll, packet_per_burst, csv_file)
-            
+                            if process == -1:
+                                tqdm.write(f"❌ {cmd_name} skew={zipf_skew} Q={queue} {policy}: app non partita, salto")
+                                sp.run(['sudo', 'pkill', '-9', '-f', 'build/(nf-chain|mica)'])
+                                sleep(5)
+                                pbar.update(1)
+                                continue
+                            try:
+                                bench = NdrBench(client, config)
+                                bench.find_ndr()
+                                final_pps = extract_final_pps(bench, policy, queue, repetition+1)
+                                if final_pps and process.poll() is None:
+                                    # metriche perf sullo stesso processo, a regime al rate NDR
+                                    perf_metrics, empty_poll, packet_per_burst = measure_steady_state(
+                                        client, process, base_command, final_pps, core_mask)
+                                    export_results_to_csv(bench, policy, queue, repetition+1, perf_metrics, METRICS,
+                                                          empty_poll, packet_per_burst, csv_file)
+                                else:
+                                    tqdm.write(f"❌ {cmd_name} skew={zipf_skew} Q={queue} {policy}: "
+                                               f"NDR non trovato o app terminata")
+                            except Exception as e:
+                                tqdm.write(f"❌ {cmd_name} skew={zipf_skew} Q={queue} {policy}: {e!r}")
+                                try:
+                                    stop_trex(client)
+                                except Exception:
+                                    pass
+                            finally:
+                                stop_program(process)
+
                             pbar.update(1)
                         # Calcola e salva la media per questo gruppo di ripetizioni
-                        calculate_and_export_averages(perf_events, csv_file, averages_csv)
-                            
-                
+                        calculate_and_export_averages(METRICS, csv_file, averages_csv)
+
                 tqdm.write(f"\n✅ Risultati salvati in {results_dir}/")
         
         pbar.close()
     
     finally:
         set_governor("schedutil")
+        if old_boost is not None:
+            set_boost(old_boost)
         tqdm.write("\nDisconnessione...")
         release_trex(client)
 
