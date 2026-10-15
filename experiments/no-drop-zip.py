@@ -553,6 +553,27 @@ for cores, lcores in ((2, "0,1"), (4, "0-3"), (8, "0-7")):
         }
 
 
+# Throughput bound of a perfect queue-selection policy: the same Zipf flows sent
+# one after the other (sequential-profile.py), so every burst holds one flow,
+# on 1 queue. TRex must send from one core, or it splits the trains over its
+# cores and interleaves the flows again.
+for app, command in (('nf-chain', EXPERIMENTS['nf-chain']['base_command']),
+                     ('mica', EXPERIMENTS['mica']['base_command'])):
+    EXPERIMENTS[f'{app}-seq'] = {
+        'base_command': command,
+        'policies': ["baseline"],
+        'repetitions': 3,
+        'queues': [1],
+        'zipf_skews': [0.1, 0.6, 0.9],
+        'profile': "sequential-profile.py",
+        'trex_core_mask': [0x1],
+    }
+    # the same with the largest RX ring the QDMA accepts (8192 descriptors,
+    # completion ring 16385): on 1 queue the 1024-packet ring absorbs only
+    # ~340 us of stall at 3 Mpps, and the zero-loss rate stops well below
+    # what the core can process
+    EXPERIMENTS[f'{app}-seq-ring8192'] = dict(EXPERIMENTS[f'{app}-seq'], additional_args="-d 8192")
+
 # Do the packet buffers of many queues push MICA's items out of the LLC? The same
 # aggressive points with 256-descriptor rings (a quarter of the buffers)
 EXPERIMENTS['mica-ring256'] = dict(EXPERIMENTS['mica'], policies=["aggressive"], queues=[64, 512],
