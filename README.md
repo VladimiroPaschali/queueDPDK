@@ -11,7 +11,7 @@ The applications run on an AMD Alveo U55N with the Open-NIC shell, extended to e
 | `nf-chain/` | Use case 1: ACL + Count-Min Sketch + NAT chain |
 | `mica/` | Use case 2: MICA key-value store, 50% GET / 50% SET |
 | `common/qflow.h` | Queue-selection policy options shared by both applications |
-| `trex-rfc/` | Zero-loss (RFC2544 NDR) throughput runs with TRex on a separate host |
+| `experiments/` | Zero-loss (RFC2544 NDR) throughput runs with TRex on a separate host |
 | `locality/` | Fig. 2: captures per-queue 5-tuples to count distinct flows per burst |
 | `extended_table.{bit,mcs}`, `ports.sh` | Open-NIC bitstream and port/register setup |
 
@@ -57,10 +57,10 @@ sudo mica/build/mica -d librte_net_qdma.so -l 0-3 -n 4 -a 0000:16:00.1 -- \
 
 ## Experiments
 
-`trex-rfc/no-drop-zip.py` finds the zero-loss rate with TRex for each queue count, policy and Zipf skew (0.1 near-uniform, 0.6 low, 0.9 high), then reruns at that rate under `perf stat`. Results go to `trex-rfc/results_<experiment>_skew<s>/`.
+`experiments/no-drop-zip.py` finds the zero-loss rate with TRex for each queue count, policy and Zipf skew (0.1 near-uniform, 0.6 low, 0.9 high), then takes `perf stat` windows on the same process at that rate. Results go to `experiments/results/ndr/results_<experiment>_skew<s>/`, and `plot_ndr.py` plots them into `experiments/plots/ndr/`.
 
 ```
-cd trex-rfc
+cd experiments
 python3 no-drop-zip.py nf-chain            # Fig. 3, 5
 python3 no-drop-zip.py mica                # Fig. 8
 python3 no-drop-zip.py nf-chain-shared2 nf-chain-shared4     # Fig. 7
