@@ -410,9 +410,10 @@ def main():
     plot_vs_queues_grid(rows, args.metric, args.panel_rates, out_dir)
     plot_zero_loss(rows, out_dir)
     pareto = load_pareto(os.path.join(results, "latency_summary.csv"))
-    skew = os.path.basename(os.path.normpath(results)).rsplit("skew", 1)[-1]
+    # results_latency_<app>_skew<skew>
+    app, skew = os.path.basename(os.path.normpath(results)).removeprefix("results_latency_").rsplit("_skew", 1)
     for metric in PARETO_METRICS:
-        title = f"nf-chain, skew {skew}: throughput against {metric} latency per queue count"
+        title = f"{app}, skew {skew}: throughput against {metric} latency per queue count"
         plot_pareto(pareto, metric, title, out_dir)
         plot_pareto_all(pareto, metric, title, out_dir)
     for policy, by_q in pareto.items():

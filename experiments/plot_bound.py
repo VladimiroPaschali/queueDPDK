@@ -5,13 +5,17 @@ plots/ndr/).
 
   python3 plot_bound.py                 # nf-chain and mica
   python3 plot_bound.py --apps mica
+  python3 plot_bound.py --apps mica-fifo-nocopy --bound seq-trex2   # another bound experiment
 
 The bound is experiment <app>-seq-ring8192: the same Zipf flows sent one after
 the other (sequential-profile.py) on 1 queue, so every burst holds one flow,
 with the largest RX ring the QDMA accepts (8192). <app>-seq, the same with
 the default 1024-descriptor ring, is not drawn: there the ring rather than the
-processing limits the zero-loss rate of nf-chain. Writes
-PDF and PNG into plots/bound/:
+processing limits the zero-loss rate of nf-chain. When the search of the bound
+ended within GENERATOR_LIMITED_ITERATIONS trials, it lost packets only at the
+first trial, the highest rate one TRex core sends (the sequential profile runs
+on one core): the bound is then that rate, a lower bound of the real one, and
+its label reads "theoretical max ≥". Writes PDF and PNG into plots/bound/:
   <app>_bound_<metric>   one panel per trace: the policies against the queues
                          (baseline called "round robin" here) and horizontal
                          lines, "theoretical max" (8192-descriptor ring) and
@@ -37,18 +41,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 BOUND_LINES = (("theoretical max", "seq-ring8192", dict(color=pn.INK, ls=(0, (5, 2)), lw=1.2)),
                ("baseline", "rr1", dict(color="#8a8a8a", ls=(0, (1, 1.5)), lw=1.4)))
+GENERATOR_LIMITED_ITERATIONS = 3
+
+
+BOUND = "seq-ring8192"  # --bound: experiment <app>-<BOUND> drawn as "theoretical max"
 
 
 def bound_levels(data, app, skew, metric):
     """(label, (mean, std), style) of the two horizontal lines of a panel."""
     out = []
     for label, key, style in BOUND_LINES:
+        key = BOUND if key == "seq-ring8192" else key
         if key != "rr1":
             rows = data.get(f"{app}-{key}", {}).get(skew, {}).get(("baseline", 1), [])
         else:
             rows = data.get(app, {}).get(skew, {}).get(("baseline", 1), [])
         s = pn.stat(rows, metric) if rows else None
         if s:
+            if key != "rr1" and all(int(r["iterations"]) <= GENERATOR_LIMITED_ITERATIONS for r in rows):
+                label += " ≥"
             out.append((label, s, style))
     return out
 
@@ -72,10 +83,11 @@ def bound_legend(fig, lines, y):
 
 def plot_bound(data, app, out_dir):
     """Policies against the bound of a perfect policy (see the module docstring)."""
-    if f"{app}-seq" not in data:
+    seq = {**data.get(f"{app}-seq", {}), **data.get(f"{app}-{BOUND}", {})}
+    if not seq:
         return
     lines = [("round robin" if l == "baseline" else l, st, src) for l, st, src in pn.single_lines(data, app)]
-    skews = [s for s in pn.SKEWS if s in data[f"{app}-seq"] or any(s in src for _, _, src in lines)]
+    skews = [s for s in pn.SKEWS if s in seq or any(s in src for _, _, src in lines)]
     for metric in list(pn.METRICS) + ["overview"]:
         metrics = list(pn.METRICS) if metric == "overview" else [metric]
         fig, axes = plt.subplots(len(metrics), len(skews), squeeze=False,
@@ -113,17 +125,21 @@ def plot_bound(data, app, out_dir):
 
 
 def main():
+    global BOUND
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", default=os.path.join(HERE, "results", "ndr"),
                         help="directory holding the results_* folders")
     parser.add_argument("--out", default=os.path.join(HERE, "plots", "bound"))
     parser.add_argument("--apps", nargs="+", default=["nf-chain", "mica"])
+    parser.add_argument("--bound", default=BOUND,
+                        help="suffix of the experiment drawn as theoretical max (default %(default)s)")
     args = parser.parse_args()
+    BOUND = args.bound
     data = pn.load(args.results)
     os.makedirs(args.out, exist_ok=True)
     for app in args.apps:
-        if f"{app}-seq" not in data:
-            print(f"{app}: no results_{app}-seq_skew* yet")
+        if f"{app}-seq" not in data and f"{app}-{BOUND}" not in data:
+            print(f"{app}: no results_{app}-seq{{,-{BOUND}}}_skew* yet")
             continue
         plot_bound(data, app, args.out)
     print(f"Plots in {args.out}/")

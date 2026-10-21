@@ -1,9 +1,12 @@
 """
-Starvation and flow completion time (FCT) campaign for nf-chain.
+Starvation and flow completion time (FCT) campaign for nf-chain, or for MICA
+with --app mica.
 
-Runs starvation/build/starvation (nf-chain plus the qprobe log) under the
-traffic of starvation-profile.py and, for every queue count, policy, skew and
-offered rate:
+Runs starvation/build/starvation (nf-chain plus the qprobe log), or
+mica/build/mica-fifo-nocopy-qprobe (the corrected single-core MICA with the
+same log, writing nothing into the packets so the TRex trailers come back
+intact), under the traffic of starvation-profile.py and, for every queue
+count, policy, skew and offered rate:
 
 * drain gap per queue: time between the last poll that left a queue empty and
   the next poll that returned packets (upper bound of the RX ring wait);
@@ -19,12 +22,20 @@ offered rate:
 
 The app is restarted for every point, so every point has its own log.
 
+With --ndr every (skew, queues, policy) is measured at its own zero-loss rate
+instead of --rates: a binary search with the same app and traffic finds the
+highest Zipf rate whose loss is <= --max-loss percent (the app runs for the
+whole search, every trial restarts the traffic and measures after a warmup;
+trials in ndr_trials.csv), then the point runs as usual at that rate. Turbo is
+off for the run, as in no-drop-zip.py.
+
 Results in <output>/: runs.csv, queues.csv, flows.csv, fct.csv,
 delayhist.csv, drainhist.csv (plots: plot_starvation.py).
 
 Examples:
   python3 starvation.py --queues 64 --policies aggressive --skews 0.6 --rates 2 --duration 4
   python3 starvation.py                       # the full campaign
+  python3 starvation.py --ndr --policies aggressive --output results/starvation/ndr
   python3 starvation.py --analyze LOG.bin     # re-analyse a kept log
 """
 
@@ -62,9 +73,18 @@ profile = _load("starvation_profile", "starvation-profile.py")
 
 TREX_SERVER = "100.78.72.16"
 PORTS = [0]
-APP = (ndz.NF_CHAIN.format(lcores="0")
-       .replace("(0,0,0),(0,1,1)", "(0,0,0)")
-       .replace("/nf-chain/build/nf-chain", "/starvation/build/starvation"))
+APPS = {
+    "nf-chain": (ndz.NF_CHAIN.format(lcores="0")
+                 .replace("(0,0,0),(0,1,1)", "(0,0,0)")
+                 .replace("/nf-chain/build/nf-chain", "/starvation/build/starvation")),
+    "mica": ndz.EXPERIMENTS["mica-fifo-nocopy"]["base_command"].replace(
+        "/mica/build/mica-fifo-nocopy ", "/mica/build/mica-fifo-nocopy-qprobe "),
+    # with the 16-byte key fix and MICA's request pipeline
+    "mica-prefetch": ndz.EXPERIMENTS["mica-fifo-nocopy"]["base_command"].replace(
+        "/mica/build/mica-fifo-nocopy ", "/mica/build/mica-fifo-nocopy-prefetch-qprobe "),
+}
+APP = APPS["nf-chain"]
+APP_BINARY = "starvation/build/starvation"  # pkill pattern of the app
 POLICIES = ["baseline", "aggressive", "penalty", "aggressive+penalty"]
 RX_DESC = 1024
 
@@ -108,7 +128,7 @@ def stop_app(proc):
     try:
         proc.wait(timeout=60)
     except sp.TimeoutExpired:
-        sp.run(["sudo", "pkill", "-9", "-f", "starvation/build/starvation"])
+        sp.run(["sudo", "pkill", "-9", "-f", APP_BINARY])
         proc.wait()
     proc.reader.join(timeout=10)
     return "".join(proc.lines)
@@ -355,13 +375,70 @@ class Writer:
             w.writerows(rows)
 
 
-def done_points(directory):
+def done_points(directory, ndr=False):
+    """Points in runs.csv; with @ndr without the rate, which the search picks."""
     path = os.path.join(directory, "runs.csv")
     if not os.path.exists(path):
         return set()
     with open(path) as f:
-        return {(float(r["skew"]), int(r["queues"]), r["policy"], float(r["rate_mpps"]))
+        return {(float(r["skew"]), int(r["queues"]), r["policy"]) + (() if ndr else (float(r["rate_mpps"]),))
                 for r in csv.DictReader(f)}
+
+
+def ndr_search(client, args, skew, queues, policy, writer, logdir):
+    """Highest Zipf rate (Mpps) in [lo, hi] whose loss is <= args.max_loss.
+    The app runs for the whole search; every trial restarts the traffic and
+    measures only after args.trial_warmup seconds, so the restart transient
+    is not counted as loss."""
+    key = dict(skew=skew, queues=queues, policy=policy)
+    log_path = os.path.join(logdir, f"search_s{skew}_q{queues}_{policy}.bin")
+    proc = launch_app(f"-q {queues} --policy {policy} --log {log_path}")
+    trials = []
+
+    def run(rate):
+        client.clear_stats(ports=PORTS)
+        client.start(ports=PORTS, mult=str(rate * 1e6 / args.flows), force=True)
+        sleep(args.trial_warmup)
+        st = client.get_stats(ports=PORTS)[PORTS[0]]
+        tx0, rx0 = st["opackets"], st["ipackets"]
+        sleep(args.trial_duration)
+        st = client.get_stats(ports=PORTS)[PORTS[0]]
+        client.stop(ports=PORTS)
+        sleep(0.5)
+        tx, rx = float(st["opackets"] - tx0), float(st["ipackets"] - rx0)
+        if tx > 0 and rx == 0:
+            # the QDMA queues sometimes stop delivering after an overload,
+            # until the app restarts: the caller retries the point
+            raise RuntimeError(f"nothing forwarded at {rate:.3f} Mpps: app or NIC stalled")
+        loss = max(0.0, (tx - rx) / tx * 100) if tx else 100.0
+        passed = tx > 0 and loss <= args.max_loss
+        trials.append(key | dict(trial=len(trials), rate_mpps=rate, tx_pps=tx / args.trial_duration,
+                                 rx_pps=rx / args.trial_duration, loss_pct=loss, passed=int(passed)))
+        tqdm.write(f"  search {rate:.3f} Mpps: loss={loss:.4f}% {'ok' if passed else 'fail'}")
+        return passed
+
+    try:
+        lo, hi = args.lo, args.hi
+        if not run(lo):
+            while lo > 0.05:  # below the lower bound: halve until a rate passes
+                hi, lo = lo, lo / 2
+                if run(lo):
+                    break
+            else:
+                lo = 0.0
+        while lo > 0 and hi - lo > args.precision and len(trials) < args.max_trials:
+            mid = (lo + hi) / 2
+            if run(mid):
+                lo = mid
+            else:
+                hi = mid
+    finally:
+        client.stop(ports=PORTS)
+        stop_app(proc)
+        if os.path.exists(log_path):
+            os.remove(log_path)
+    writer.write("ndr_trials.csv", trials)
+    return round(lo, 3)
 
 
 def run_point(client, meta, args, skew, queues, policy, rate, writer, logdir):
@@ -452,6 +529,7 @@ def run_point(client, meta, args, skew, queues, policy, rate, writer, logdir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--app", default="nf-chain", choices=list(APPS))
     parser.add_argument("--queues", type=int, nargs="+", default=[1, 64, 128, 1024, 2048])
     parser.add_argument("--policies", nargs="+", default=POLICIES, choices=POLICIES)
     parser.add_argument("--skews", type=float, nargs="+", default=[0.1, 0.6, 0.9])
@@ -463,9 +541,22 @@ def main():
     parser.add_argument("--keep-logs", action="store_true", help="keep the binary qprobe logs")
     parser.add_argument("--trex-cores", type=int, default=4,
                         help="TRex DP cores per port, which split the field-engine seq (0: detect)")
+    parser.add_argument("--ndr", action="store_true",
+                        help="run every point at its zero-loss rate, found by a binary search, instead of --rates")
+    parser.add_argument("--max-loss", type=float, default=0.1, help="--ndr: percent of the packets of a trial")
+    parser.add_argument("--lo", type=float, default=1.0, help="--ndr: Mpps, lower bound of the search")
+    parser.add_argument("--hi", type=float, default=4.0, help="--ndr: Mpps, upper bound of the search")
+    parser.add_argument("--precision", type=float, default=0.02, help="--ndr: Mpps")
+    parser.add_argument("--max-trials", type=int, default=12, help="--ndr: trials per search")
+    parser.add_argument("--trial-warmup", type=float, default=5.0,
+                        help="--ndr: seconds at the trial rate before measuring")
+    parser.add_argument("--trial-duration", type=float, default=10.0, help="--ndr: seconds measured per trial")
     parser.add_argument("--output", default="results/starvation", help="relative to experiments/")
     parser.add_argument("--analyze", metavar="LOG", help="only analyse a kept log (needs --skews)")
     args = parser.parse_args()
+    global APP, APP_BINARY
+    APP = APPS[args.app]
+    APP_BINARY = shlex.split(APP)[1].split("/queueDPDK/", 1)[1]
 
     if args.analyze:
         _, meta = profile.build(skew=args.skews[0], num_flows=args.flows, ref_mpps=max(args.rates))
@@ -479,16 +570,18 @@ def main():
     logdir = os.path.join(out_dir, "logs")
     os.makedirs(logdir, exist_ok=True)
     writer = Writer(out_dir)
-    done = done_points(out_dir)
+    done = done_points(out_dir, args.ndr)
 
-    points = [(s, q, p, r) for s in args.skews for q in args.queues for p in args.policies for r in args.rates]
-    todo = [pt for pt in points if pt not in done]
+    rates = [None] if args.ndr else args.rates
+    points = [(s, q, p, r) for s in args.skews for q in args.queues for p in args.policies for r in rates]
+    todo = [pt for pt in points if (pt[:3] if args.ndr else pt) not in done]
     tqdm.write(f"{len(todo)} points to run ({len(points) - len(todo)} already in {out_dir})")
 
     client = STLClient(server=TREX_SERVER)
     client.connect()
     client.acquire(ports=PORTS, force=True)
     ndz.set_governor("performance")
+    old_boost = ndz.set_boost(0) if args.ndr else None
     try:
         pbar = tqdm(total=len(todo), unit="pt")
         loaded = None
@@ -496,14 +589,19 @@ def main():
             if loaded != skew:
                 meta = load_streams(client, skew, args)
                 loaded = skew
-            pbar.set_description(f"s={skew} Q={queues} {policy} {rate}Mpps")
+            pbar.set_description(f"s={skew} Q={queues} {policy} {rate or 'NDR'}Mpps")
             for attempt in range(2):
                 try:
+                    if args.ndr:
+                        rate = ndr_search(client, args, skew, queues, policy, writer, logdir)
+                        tqdm.write(f"  zero-loss rate {rate:.3f} Mpps")
+                        if rate <= 0:
+                            raise RuntimeError("no rate passed the search")
                     run = run_point(client, meta, args, skew, queues, policy, rate, writer, logdir)
                     break
                 except Exception as e:  # noqa: BLE001
                     tqdm.write(f"⚠️ point failed ({e}); {'retrying' if attempt == 0 else 'skipped'}")
-                    sp.run(["sudo", "pkill", "-9", "-f", "starvation/build/starvation"])
+                    sp.run(["sudo", "pkill", "-9", "-f", APP_BINARY])
                     sleep(3)
             else:
                 pbar.update(1)
@@ -518,6 +616,8 @@ def main():
     finally:
         ndz.release_trex(client)
         ndz.set_governor("schedutil")
+        if old_boost is not None:
+            ndz.set_boost(old_boost)
     tqdm.write(f"Results in {out_dir}/")
 
 

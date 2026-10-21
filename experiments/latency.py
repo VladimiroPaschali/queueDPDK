@@ -1,5 +1,5 @@
 """
-Latency of nf-chain (paper Fig. 6) with TRex.
+Latency of nf-chain (paper Fig. 6), or of MICA with --app mica, with TRex.
 
 TRex sends the Zipf load of zipf-profile.py at a fixed rate plus a probe flow
 with a 5-tuple of its own, carrying TRex latency stats. For every queue count,
@@ -12,8 +12,11 @@ script measures it: it runs nf-chain on its own, sends only the probe and reads
 the per-queue histogram the application prints on exit. Results are cached in
 latency_queues.json.
 
-MICA is not supported: it writes a 1400-byte value into the packet payload,
-which overwrites the latency header TRex appends to the probe.
+MICA writes the value it reads into the packet payload, over the latency
+trailer TRex appends to the probe: --app mica runs mica-fifo-nocopy-lat, the
+corrected single-core MICA that writes nothing into the packet. It does not
+print the per-queue histogram, so it relies on the probe queues cached by an
+nf-chain run (they depend only on the NIC hash).
 
 Examples:
   python3 latency.py --queues 1 64 --min 1 --max 5 --step 0.5
@@ -61,6 +64,15 @@ TREX_SERVER = "100.78.72.16"
 PORTS = [0]
 PROFILE_FILE = os.path.join(HERE, "zipf-profile.py")
 NF_CHAIN = ndz.EXPERIMENTS["nf-chain"]["base_command"]
+APPS = {
+    "nf-chain": NF_CHAIN,
+    "mica": ndz.EXPERIMENTS["mica-fifo-nocopy"]["base_command"].replace(
+        "/mica/build/mica-fifo-nocopy ", "/mica/build/mica-fifo-nocopy-lat "),
+    # with the 16-byte key fix and MICA's request pipeline
+    "mica-prefetch": ndz.EXPERIMENTS["mica-fifo-nocopy"]["base_command"].replace(
+        "/mica/build/mica-fifo-nocopy ", "/mica/build/mica-fifo-nocopy-prefetch-lat "),
+}
+APP = NF_CHAIN
 QUEUE_CACHE = os.path.join(HERE, "latency_queues.json")
 
 # Probe flow: outside the address pools zipf-profile.py draws from
@@ -133,7 +145,7 @@ def probe_only_stream(client):
 # ---------------------------------------------------------------------------
 
 def launch_app(args):
-    command = f"{NF_CHAIN} {args}"
+    command = f"{APP} {args}"
     tqdm.write("Running: " + command)
     proc = sp.Popen(shlex.split(command), stdout=sp.PIPE, stderr=sp.STDOUT, text=True, bufsize=1)
     ready = threading.Event()
@@ -150,7 +162,7 @@ def launch_app(args):
     proc.lines, proc.reader = lines, thread
     if not ready.wait(timeout=60):
         stop_app(proc)
-        raise RuntimeError("nf-chain did not become ready:\n" + "".join(lines[-20:]))
+        raise RuntimeError("the app did not become ready:\n" + "".join(lines[-20:]))
     return proc
 
 
@@ -300,6 +312,19 @@ def measure(client, rate_mpps, warmup, duration):
     return result
 
 
+def read_results(path):
+    """Rows of an earlier run, with the types measure() and main() give them."""
+    rows = []
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            row = {k: float(v) for k, v in r.items() if k not in ("policy", "zero_loss")}
+            for k in ("queues", "latency_queue", "repetition"):
+                row[k] = int(row[k])
+            row.update(policy=r["policy"], zero_loss=r["zero_loss"] == "True")
+            rows.append(row)
+    return rows
+
+
 def write_results(path, rows):
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
@@ -338,6 +363,7 @@ def rate_range(lo, hi, step):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--app", default="nf-chain", choices=list(APPS))
     parser.add_argument("--queues", type=int, nargs="+", default=ndz.ALL_QUEUES)
     parser.add_argument("--policies", nargs="+", default=list(POLICIES), choices=list(POLICIES))
     parser.add_argument("--min", type=float, default=1.0, help="lowest rate in Mpps")
@@ -350,13 +376,17 @@ def main():
     parser.add_argument("--duration", type=float, default=5.0, help="seconds per sample")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--rediscover", action="store_true", help="ignore latency_queues.json")
+    parser.add_argument("--resume", action="store_true",
+                        help="keep the points already in latency_results.csv and measure only the others")
     parser.add_argument("--output", help="results directory, relative to experiments/ "
-                        "(default results/latency/results_latency_nf-chain_skew<skew>)")
+                        "(default results/latency/results_latency_<app>_skew<skew>)")
     args = parser.parse_args()
+    global APP
+    APP = APPS[args.app]
 
     rates = rate_range(args.min, args.max, args.step)
     results_dir = os.path.join(HERE, args.output or os.path.join("results", "latency",
-                                                                 f"results_latency_nf-chain_skew{args.skew}"))
+                                                                 f"results_latency_{args.app}_skew{args.skew}"))
     os.makedirs(results_dir, exist_ok=True)
     results_csv = os.path.join(results_dir, "latency_results.csv")
     summary_csv = os.path.join(results_dir, "latency_summary.csv")
@@ -365,7 +395,8 @@ def main():
     client.connect()
     client.acquire(ports=PORTS, force=True)
     ndz.set_governor("performance")
-    rows = []
+    rows = read_results(results_csv) if args.resume and os.path.isfile(results_csv) else []
+    done = {(r["queues"], r["policy"], round(r["rate_mpps"], 3), r["repetition"]) for r in rows}
     try:
         lat_queue = latency_queues(client, args.queues, args.rediscover)
         load_streams(client, args.skew, args.flows, args.probe_pps)
@@ -374,23 +405,27 @@ def main():
         pbar = tqdm(total=total, unit="pt")
         for queues in args.queues:
             for policy in args.policies:
+                todo = [(rate, rep) for rate in rates for rep in range(1, args.repetitions + 1)
+                        if (queues, policy, round(rate, 3), rep) not in done]
+                pbar.update(len(rates) * args.repetitions - len(todo))
+                if not todo:
+                    continue
                 app_args = f"-q {queues} " + POLICIES[policy].format(q=lat_queue[queues])
                 proc = launch_app(app_args)
                 try:
-                    for rate in rates:
-                        for rep in range(1, args.repetitions + 1):
-                            pbar.set_description(f"Q={queues:4d} {policy:18} {rate:.2f} Mpps")
-                            r = measure(client, rate, args.warmup, args.duration)
-                            r.update(queues=queues, policy=policy, latency_queue=lat_queue[queues],
-                                     rate_mpps=rate, repetition=rep)
-                            rows.append(r)
-                            write_results(results_csv, rows)
-                            tqdm.write(
-                                f"Q={queues} {policy} {rate} Mpps: p50={r['p50']:.1f} "
-                                f"p99={r['p99']:.1f} us, loss={r['loss_pct']:.3f}% "
-                                f"probe {r['probe_rx']:.0f}/{r['probe_tx']:.0f}"
-                            )
-                            pbar.update(1)
+                    for rate, rep in todo:
+                        pbar.set_description(f"Q={queues:4d} {policy:18} {rate:.2f} Mpps")
+                        r = measure(client, rate, args.warmup, args.duration)
+                        r.update(queues=queues, policy=policy, latency_queue=lat_queue[queues],
+                                 rate_mpps=rate, repetition=rep)
+                        rows.append(r)
+                        write_results(results_csv, rows)
+                        tqdm.write(
+                            f"Q={queues} {policy} {rate} Mpps: p50={r['p50']:.1f} "
+                            f"p99={r['p99']:.1f} us, loss={r['loss_pct']:.3f}% "
+                            f"probe {r['probe_rx']:.0f}/{r['probe_tx']:.0f}"
+                        )
+                        pbar.update(1)
                 finally:
                     client.stop(ports=PORTS)
                     stop_app(proc)
