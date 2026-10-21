@@ -39,7 +39,10 @@ MEHCACHED_BEGIN
 #define MEHCACHED_MTH_THRESHOLD_FIFO (0.0)
 #define MEHCACHED_MTH_THRESHOLD_LRU (1.0)
 
+// MICA_POOL_PER_LCORE variants (mica/Makefile) give every lcore its own log pool
+#ifndef MEHCACHED_MULTI_ALLOC
 #define MEHCACHED_SINGLE_ALLOC
+#endif
 
 #ifdef MEHCACHED_COLLECT_STATS
 #define MEHCACHED_STAT_INC(table, name) do { __sync_add_and_fetch(&(table)->stats.name, 1); } while (0)
