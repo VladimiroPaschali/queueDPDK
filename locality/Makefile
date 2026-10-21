@@ -51,7 +51,8 @@ DPDK_DRIVERS := $(filter-out $(addprefix $(DPDK_BUILD)/drivers/, $(EXCLUDED_DRIV
 CFLAGS_LOCAL += $(DPDK_INCLUDES) -DALLOW_EXPERIMENTAL_API -O3 -march=native
 LDFLAGS_LOCAL = -Wl,--as-needed -Wl,--no-undefined -Wl,-O1 \
 	-Wl,--whole-archive $(DPDK_LIBS) $(DPDK_DRIVERS) -Wl,--no-whole-archive \
-	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs
+	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs \
+	$(shell pkg-config --libs jansson 2>/dev/null)  # librte_metrics telemetry, if DPDK was configured with jansson
 
 # CFLAGS_LOCAL += $(DPDK_INCLUDES) \
 #   -DALLOW_EXPERIMENTAL_API \

@@ -1,4 +1,7 @@
 sudo /home/vladimiro/dpdk_patched/dpdk-20.11/usertools/dpdk-devbind.py -u 16:00.0 16:00.1
+# after a reboot the BAR is not decoded (Mem-): without this the pcimem writes
+# are lost and read back 0xFFFFFFFF
+sudo setpci -s 16:00.0 COMMAND=0x0002:0x0002
 sudo /home/andrea/pcimem/pcimem /sys/bus/pci/devices/0000\:16\:00.0/resource2  0x1000 w 0x1;
 sudo /home/andrea/pcimem/pcimem /sys/bus/pci/devices/0000\:16\:00.0/resource2 0x2000 w 0x00010001;
 sudo /home/andrea/pcimem/pcimem /sys/bus/pci/devices/0000\:16\:00.0/resource2 0x8014 w 0x1;
