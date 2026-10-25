@@ -5,6 +5,11 @@
 #include "ported-mica/table.h"
 #include "rte_pmd_qdma.h"
 #include "qflow.h"
+#include "qbitstream.h"
+#ifdef MICA_ADAPTIVE
+#include "adaptive.h" /* ../adaptive/src: adaptive queue count */
+#include "qdma_rss.h"
+#endif
 #ifdef MICA_QPROBE
 #include "qprobe.h" /* starvation/src: poll timestamps and marked packets */
 #endif
@@ -114,6 +119,14 @@ static uint64_t    qp_records  = 8u << 20;
 #define QP_LONG_OPTIONS
 #endif
 
+#ifdef MICA_ADAPTIVE
+#define AD_LONG_OPTIONS ADAPTIVE_LONG_OPTIONS,
+#define AD_USAGE ADAPTIVE_USAGE
+#else
+#define AD_LONG_OPTIONS
+#define AD_USAGE ""
+#endif
+
 #ifdef MICA_SHARED_AFFINITY
 /* Shared with affinity: whether an lcore found a full burst on its own queues
  * in its last sweep, indexed by lcore index */
@@ -143,6 +156,26 @@ init_rx_queue_locks(void)
 		for (uint16_t qid = 0; qid < MAX_RX_QUEUE_PER_PORT; qid++)
 			rte_spinlock_init(RX_QUEUE_LOCK(pid, qid));
 }
+
+#ifdef MICA_ADAPTIVE
+/* Adaptive queue count on a single core (../adaptive/src/adaptive.h): the
+ * mask register, the loop, the controller and the per-second statistics
+ * follow the adaptive app (adaptive/src/main.c), with MICA's work per burst */
+void                        qdma_reg_write_usr(void *dev_hndl, uint32_t reg_offst, uint32_t val);
+static struct adaptive_opts adaptive_opts;
+static struct adaptive_ctl  adaptive_ctl;
+static uint32_t             rss_mask_reg = UINT32_MAX;
+static uint16_t             active_queues; /* queues the NIC steers to */
+static uint16_t             polled_queues; /* active_queues plus those still draining */
+static uint64_t             drain_until;   /* tsc before which draining queues stay polled */
+static uint16_t             rx_ring_size = 1;
+/* Polls of the active queues in the current second, and the cycles of the
+ * sweeps that found work */
+static uint64_t sec_polls, sec_empty, sec_full, sec_busy_cycles, sec_cycles;
+/* Backlog left in a queue after a full poll, in the current second: largest
+ * and how many full polls left more than half the ring */
+static uint32_t sec_backlog_max, sec_backlog_half;
+#endif
 
 static void
 print_stats(void)
@@ -238,6 +271,23 @@ print_stats(void)
 	n_bursts  = 0;
 	n_pkts    = 0;
 	qflow_print(&qflow, queues);
+#ifdef MICA_ADAPTIVE
+	/* the lines adaptive.py parses, as the adaptive app prints them */
+	printf("poll mix: active polls %" PRIu64 ", empty %.1f%%, full %.1f%%, busy %.3f, "
+	       "backlog max %.1f%%, over half %.3f%%\n",
+	       sec_polls,
+	       sec_polls ? 100.0 * (double)sec_empty / (double)sec_polls : 0.0,
+	       sec_polls ? 100.0 * (double)sec_full / (double)sec_polls : 0.0,
+	       sec_cycles ? (double)sec_busy_cycles / (double)sec_cycles : 0.0,
+	       100.0 * sec_backlog_max / rx_ring_size,
+	       sec_full ? 100.0 * (double)sec_backlog_half / (double)sec_full : 0.0);
+	sec_polls = sec_empty = sec_full = sec_busy_cycles = sec_cycles = 0;
+	sec_backlog_max = sec_backlog_half = 0;
+	printf("RSS queues: %u (polled %u)", active_queues, polled_queues);
+	if (adaptive_opts.enabled)
+		printf(", adaptive signal, %" PRIu64 " changes", adaptive_ctl.changes);
+	printf("\n");
+#endif
 	printf("\n====================================================\n");
 	if (after_warmup)
 		measured_tick++;
@@ -650,7 +700,6 @@ poll_loop(const enum qflow_mode mode)
 					force_quit = true;
 					break;
 				}
-
 				if (mode == QFLOW_SINGLE) {
 					uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
 					for (int j = nb_tx; j < nb_rx; j++)
@@ -748,10 +797,339 @@ poll_loop(const enum qflow_mode mode)
 	return 0;
 }
 
+#ifdef MICA_ADAPTIVE
+/***********************adaptive queue count******************************/
+
+/* After a shrink, the dropped queues are polled for at least this long */
+#define DRAIN_MIN_US 200
+
+static uint32_t
+rss_reta_first(uint16_t pid)
+{
+	struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
+	struct rte_eth_dev_info         dev_info;
+
+	if (rte_eth_dev_info_get(pid, &dev_info) != 0)
+		return UINT32_MAX;
+	for (unsigned i = 0; i < RTE_DIM(reta_conf); i++)
+		reta_conf[i].mask = ~0ULL;
+	if (rte_eth_dev_rss_reta_query(pid, reta_conf, dev_info.reta_size) != 0)
+		return UINT32_MAX;
+	return reta_conf[0].reta[0];
+}
+
+/* The mask register is 16 bits wide and its first read after startup can
+ * return garbage: read twice and keep the low half (adaptive/src/main.c) */
+static uint32_t
+rss_mask_read(struct rte_eth_dev *dev, uint32_t reg)
+{
+	(void)qdma_reg_read_usr(dev, reg);
+	return qdma_reg_read_usr(dev, reg) & 0xffff;
+}
+
+/*
+ * The mask register is the one qdma_dev_reta_update() writes, at the address
+ * the PMD derives from its func_id (qdma_rss.c); no other address is touched.
+ * Check that it holds queues - 1 and that a change to it shows up in
+ * rte_eth_dev_rss_reta_query(), then restore it.
+ */
+static int
+rss_mask_locate(uint16_t pid, uint16_t nq)
+{
+	struct rte_eth_dev *dev   = &rte_eth_devices[pid];
+	const uint32_t      reg   = qdma_rss_mask_reg(pid);
+	const uint32_t      probe = nq / 2 - 1;
+	const uint32_t      old   = rss_mask_read(dev, reg);
+	uint32_t            seen;
+
+	if (old != nq - 1u) {
+		printf("RSS mask register 0x%x holds %u, expected %u\n", reg, old, nq - 1u);
+		return -1;
+	}
+	qdma_reg_write_usr(dev, reg, probe);
+	seen = rss_reta_first(pid);
+	qdma_reg_write_usr(dev, reg, old);
+	if (seen != probe) {
+		printf("RSS mask register 0x%x: wrote %u, reta query read %u\n", reg, probe, seen);
+		return -1;
+	}
+	rss_mask_reg = reg;
+	return 0;
+}
+
+/*
+ * Change the number of queues the NIC steers to. Growing starts polling the
+ * new queues before the NIC fills them; shrinking keeps polling the dropped
+ * queues until a sweep finds them empty after DRAIN_MIN_US.
+ */
+static void
+set_active_queues(uint16_t n, uint64_t now)
+{
+	struct rte_eth_dev *dev = &rte_eth_devices[portid];
+
+	if (n > active_queues) {
+		for (uint16_t q = active_queues; q < n; q++)
+			queue_hit[q] = penalty;
+		active_queues = n;
+		if (polled_queues < n)
+			polled_queues = n;
+		qdma_reg_write_usr(dev, rss_mask_reg, n - 1u);
+	} else if (n < active_queues) {
+		qdma_reg_write_usr(dev, rss_mask_reg, n - 1u);
+		active_queues = n;
+		drain_until   = now + DRAIN_MIN_US * rte_get_timer_hz() / US_PER_S;
+	}
+}
+
+static void
+adaptive_step(uint64_t now,
+              uint64_t cycles,
+              uint64_t pkts,
+              uint64_t polls,
+              uint64_t empty_polls,
+              double   backlog_share)
+{
+	const unsigned prev = adaptive_ctl.cur_log;
+	const unsigned next =
+	    adaptive_epoch(&adaptive_ctl, polls, empty_polls, backlog_share, cycles, pkts);
+
+	if (next == prev)
+		return;
+	set_active_queues((uint16_t)(1u << next), now);
+	printf("adaptive: %u -> %u queues after signal epoch: %.1f cycles/pkt (base %.1f), "
+	       "empty %.1f%%, backlog share %.2f%%\n",
+	       1u << prev,
+	       1u << next,
+	       pkts ? (double)cycles / (double)pkts : 0.0,
+	       adaptive_ctl.grow_cost,
+	       100.0 * adaptive_ctl.last_empty,
+	       100.0 * adaptive_ctl.last_backlog);
+}
+
+static void
+print_adaptive_summary(void)
+{
+	uint64_t total_epochs = 0;
+
+	for (unsigned l = 0; l <= ADAPTIVE_MAX_LOG; l++)
+		total_epochs += adaptive_ctl.epochs[l];
+	printf("\nadaptive: %" PRIu64 " changes, final %u queues, epochs per queue count:\n",
+	       adaptive_ctl.changes,
+	       active_queues);
+	for (unsigned l = 0; l <= ADAPTIVE_MAX_LOG; l++)
+		if (adaptive_ctl.epochs[l])
+			printf("adaptive: %4u queues %8" PRIu64 " (%6.2f%%)\n",
+			       1u << l,
+			       adaptive_ctl.epochs[l],
+			       100.0 * (double)adaptive_ctl.epochs[l] / (double)total_epochs);
+}
+
+/*
+ * Single-core loop of the adaptive variant, as poll_loop() of the adaptive
+ * app: sweeps the polled queues (the active ones plus those still draining
+ * after a shrink, polled every sweep), prints statistics every second, sends
+ * each burst on TX queue 0 and measures throughput after a 3 s warmup.
+ * Penalty and Aggressive apply to the active queues. With --latency-queue,
+ * every latency-period regular polls one poll goes to the queue of the
+ * latency flow among the active ones. With --adaptive, the controller runs at
+ * the end of every epoch on the cycles of the sweeps that found work.
+ */
+static int
+adaptive_poll_loop(void)
+{
+	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
+	const unsigned   lcore_id = rte_lcore_id();
+	uint64_t         prev_tsc, diff_tsc, cur_tsc = 0, timer_tsc = 0, end_warmup = 0;
+	int              i, nb_rx, ret;
+	int             *hit = queue_hit;
+
+	const bool     adaptive     = adaptive_opts.enabled;
+	const uint64_t epoch_period = (uint64_t)adaptive_opts.epoch_ms * rte_get_timer_hz() / MS_PER_S;
+	uint64_t       epoch_tsc = 0, epoch_cycles = 0, epoch_pkts = 0;
+	uint64_t       epoch_polls = 0, epoch_empty = 0, epoch_full = 0, epoch_half = 0;
+	uint32_t       sweep_pkts = 0, sweep_polls = 0, sweep_empty = 0, sweep_full = 0, sweep_half = 0;
+
+	const bool latency_mode   = qflow.latency;
+	const int  latency_period = qflow.latency_period;
+	int        latency_count  = 0, resume_i = -1;
+	bool       inject_queue   = false;
+
+	printf("entering main loop on lcore %u\n", lcore_id);
+	fflush(stdout);
+
+	uint64_t start_time  = rte_rdtsc();
+	uint64_t warmup_time = 3 * rte_get_timer_hz();
+	uint64_t stop_time   = (10 * rte_get_timer_hz()) + warmup_time;
+	prev_tsc             = start_time;
+
+	while (!force_quit) {
+		bool slow_path = false;
+
+		cur_tsc  = rte_rdtsc();
+		diff_tsc = cur_tsc - prev_tsc;
+		/* the previous sweep counts for the controller, and its poll outcomes,
+		 * only if it found work: an idle core spinning on empty queues wastes
+		 * nothing */
+		if (sweep_pkts > 0) {
+			epoch_cycles += diff_tsc;
+			epoch_pkts += sweep_pkts;
+			sec_busy_cycles += diff_tsc;
+			epoch_polls += sweep_polls;
+			epoch_empty += sweep_empty;
+			epoch_full += sweep_full;
+			epoch_half += sweep_half;
+			sec_polls += sweep_polls;
+			sec_empty += sweep_empty;
+			sec_full += sweep_full;
+			sweep_pkts = 0;
+		}
+		sec_cycles += diff_tsc;
+		sweep_polls = sweep_empty = sweep_full = sweep_half = 0;
+		if (timer_period > 0) {
+			timer_tsc += diff_tsc;
+			if (unlikely(timer_tsc >= timer_period)) {
+				print_stats();
+				timer_tsc = 0;
+				slow_path = true;
+			}
+		}
+		if (adaptive) {
+			epoch_tsc += diff_tsc;
+			if (unlikely(epoch_tsc >= epoch_period)) {
+				adaptive_step(cur_tsc, epoch_cycles, epoch_pkts, epoch_polls, epoch_empty,
+				              epoch_full ? (double)epoch_half / (double)epoch_full : 0.0);
+				epoch_tsc    = 0;
+				epoch_cycles = 0;
+				epoch_pkts   = 0;
+				epoch_polls = epoch_empty = epoch_full = epoch_half = 0;
+				slow_path    = true;
+			}
+		}
+		/* keep statistics and controller time out of the next sweep */
+		prev_tsc = slow_path ? rte_rdtsc() : cur_tsc;
+
+		int        max_loops  = QFLOW_MAX_CONSECUTIVE_POLLS;
+		const int  sweep_end  = polled_queues;
+		const int  active_end = active_queues;
+		bool       drained    = true;
+		const bool draining   = sweep_end > active_end;
+		/* --latency-queue names the queue with -q queues: the NIC steers with
+		 * hash & (active - 1), so with fewer active queues the flow is on its
+		 * low bits */
+		const int latency_queue = latency_mode ? qflow.latency_queue & (active_end - 1) : -1;
+
+		for (i = 0; i < sweep_end; ++i) {
+			bool drain_queue = i >= active_end;
+
+			if (!drain_queue && (penalty > 0) && (hit[i] < penalty)) {
+				hit[i]++;
+				skip_count++;
+				continue;
+			}
+			if (unlikely(inject_queue)) {
+				resume_i     = i;
+				i            = latency_queue;
+				inject_queue = false;
+				drain_queue  = false;
+			}
+
+			nb_rx = rte_eth_rx_burst(portid, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
+			n_bursts++;
+			n_pkts += nb_rx;
+			sweep_pkts += nb_rx;
+			if (drain_queue && nb_rx > 0)
+				drained = false;
+
+			if (nb_rx > 0) {
+				ret = mica_process_burst(pkts_burst, nb_rx, QFLOW_SINGLE);
+				if (ret == 1) {
+					printf("Received stop signal, exiting main loop\n");
+					end_time   = cur_tsc - end_warmup;
+					force_quit = true;
+					break;
+				}
+				uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+				for (int j = nb_tx; j < nb_rx; j++)
+					rte_pktmbuf_free(pkts_burst[j]);
+
+				port_statistics[portid][i].rx += nb_rx;
+				if (after_warmup)
+					measured_packets_rx += nb_rx;
+			}
+
+			/* a latency poll is not a poll of the sweep: no Penalty, Aggressive
+			 * or controller statistics, and i goes back into the sweep */
+			bool latency_poll = false;
+			if (latency_mode) {
+				if (resume_i != -1 && i == latency_queue) {
+					i            = resume_i - 1;
+					resume_i     = -1;
+					latency_poll = true;
+				} else if (!drain_queue && i != latency_queue && ++latency_count == latency_period) {
+					latency_count = 0;
+					inject_queue  = true;
+				}
+			}
+
+			if (!drain_queue && !latency_poll) {
+				sweep_polls++;
+				sweep_empty += nb_rx == 0;
+				if (nb_rx == MAX_PKT_BURST) {
+					/* what the full burst left behind in the ring */
+					const uint32_t b = qdma_rx_backlog(portid, (uint16_t)i);
+
+					sweep_full++;
+					sweep_half += 2 * b > rx_ring_size;
+					if (b > sec_backlog_max)
+						sec_backlog_max = b;
+					sec_backlog_half += 2 * b > rx_ring_size;
+				}
+				if (penalty > 0 && max_loops == QFLOW_MAX_CONSECUTIVE_POLLS)
+					hit[i] = penalty * (nb_rx > MAX_PKT_BURST / 2);
+
+				if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
+					i--;
+					max_loops--;
+				} else {
+					max_loops = QFLOW_MAX_CONSECUTIVE_POLLS;
+				}
+			}
+
+			if (nb_rx < MAX_PKT_BURST)
+				spin_time++;
+			spin_pkt += nb_rx;
+			if (nb_rx == 0)
+				empty++;
+		}
+
+		/* the dropped queues are empty and the NIC no longer fills them */
+		if (draining && drained && cur_tsc >= drain_until)
+			polled_queues = active_queues;
+
+		if ((cur_tsc - start_time) > stop_time) {
+			end_time = cur_tsc - end_warmup;
+		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
+			printf("Warmup finished\n");
+			after_warmup = true;
+			end_warmup   = cur_tsc;
+			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
+		}
+	}
+	end_time = rte_rdtsc() - end_warmup;
+	return 0;
+}
+
+/***********************end of adaptive queue count******************************/
+#endif
+
 static int
 main_loop_single(__rte_unused void *dummy)
 {
+#ifdef MICA_ADAPTIVE
+	return adaptive_poll_loop();
+#else
 	return poll_loop(QFLOW_SINGLE);
+#endif
 }
 
 static int
@@ -788,7 +1166,7 @@ print_usage(const char *prgname)
 	printf("%s [EAL options] -- [-q N] [-d N] [-v] [policy options]\n"
 	       "  -q N: number of RX queues\n"
 	       "  -d N: RX descriptors per queue (power of 2, >= 64)\n"
-	       "  -v : print per-queue statistics\n" QFLOW_USAGE,
+	       "  -v : print per-queue statistics\n" QFLOW_USAGE AD_USAGE,
 	       prgname);
 }
 
@@ -801,7 +1179,7 @@ parse_args(int argc, char **argv)
 	static const char short_options[] = "q:" /* queues       */
 	                                    "d:" /* descriptors  */
 	                                    "v"; /* verbose      */
-	static struct option lgopts[]     = {QFLOW_LONG_OPTIONS, QP_LONG_OPTIONS {NULL, 0, 0, 0}};
+	static struct option lgopts[]     = {QFLOW_LONG_OPTIONS, QP_LONG_OPTIONS AD_LONG_OPTIONS{NULL, 0, 0, 0}};
 
 	/* reset getopt internal state (important when relaunching app) */
 	optind         = 1;
@@ -847,6 +1225,15 @@ parse_args(int argc, char **argv)
 				}
 				break;
 			}
+#endif
+#ifdef MICA_ADAPTIVE
+			ret = adaptive_parse_long_opt(&adaptive_opts, lgopts[option_index].name, optarg);
+			if (ret < 0) {
+				print_usage(prgname);
+				return -1;
+			}
+			if (ret > 0)
+				break;
 #endif
 			if (qflow_parse_long_opt(&qflow, lgopts[option_index].name, optarg) > 0)
 				break;
@@ -988,6 +1375,9 @@ main(int argc, char **argv)
 
 	/* parse application arguments (after the EAL ones) */
 	qflow_opts_init(&qflow);
+#ifdef MICA_ADAPTIVE
+	adaptive_opts_init(&adaptive_opts);
+#endif
 	ret = parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid MICA parameters\n");
@@ -998,6 +1388,32 @@ main(int argc, char **argv)
 	aggressive = qflow.aggressive;
 	penalty    = qflow.penalty ? qflow.penalty_turns : 0;
 	qflow_print(&qflow, queues);
+#ifdef MICA_ADAPTIVE
+	if (nb_lcores != 1 || qflow.mode != QFLOW_SINGLE)
+		rte_exit(EXIT_FAILURE, "adaptive runs on one lcore\n");
+	if (adaptive_check(&adaptive_opts, queues) < 0)
+		rte_exit(EXIT_FAILURE, "Invalid adaptive configuration\n");
+	if (adaptive_opts.snapshot_ms)
+		printf("--snapshot-ms is ignored by MICA\n");
+	if (adaptive_opts.enabled)
+		printf("Adaptive: %u to %u queues, start %u, epoch %u ms, threshold %u%%, hold %u\n",
+		       adaptive_opts.min,
+		       queues,
+		       adaptive_opts.start,
+		       adaptive_opts.epoch_ms,
+		       adaptive_opts.threshold_pct,
+		       adaptive_opts.hold);
+	if (adaptive_opts.enabled)
+		printf("Adaptive signal mode: double above %g%% of full polls leaving half the ring, halve "
+		       "above %u%% empty polls or below %g%%\n",
+		       adaptive_opts.backlog_high_pct,
+		       adaptive_opts.empty_high_pct,
+		       adaptive_opts.backlog_low_pct);
+	if (adaptive_opts.enabled && adaptive_opts.search)
+		printf("Adaptive search: a flat grow jumps 2, 4, 8 octaves before it is undone, "
+		       "trying fewer queues is judged, no signal for %u epochs probes fewer\n",
+		       ADAPTIVE_PROBE_EPOCHS);
+#endif
 
 	uint16_t nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
@@ -1094,6 +1510,8 @@ main(int argc, char **argv)
 		printf("wrong bitstream\n");
 		return 0;
 	}
+	// which variant: C2H prefetch cache and completion coalescing depth
+	qbitstream_print(dev);
 
 	struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
 	for (int i = 0; i < dev_info.reta_size / RTE_RETA_GROUP_SIZE; i++) {
@@ -1271,6 +1689,20 @@ main(int argc, char **argv)
 			assert(false);
 	}
 
+#ifdef MICA_ADAPTIVE
+	/* RX queues the NIC starts with */
+	rx_ring_size  = qdma_rx_ring_size(portid, 0);
+	active_queues = queues;
+	polled_queues = queues;
+	if (adaptive_opts.enabled) {
+		if (rss_mask_locate(portid, queues) < 0)
+			rte_exit(EXIT_FAILURE, "Cannot find the RSS mask register of port %u\n", portid);
+		printf("RSS mask register: 0x%x\n", rss_mask_reg);
+		adaptive_ctl_init(&adaptive_ctl, &adaptive_opts, queues);
+		set_active_queues((uint16_t)adaptive_opts.start, rte_rdtsc());
+	}
+#endif
+
 	/* Launch main loops */
 	lcore_function_t *main_loop = main_loop_single;
 	if (qflow.mode == QFLOW_PARTITIONED)
@@ -1298,6 +1730,10 @@ main(int argc, char **argv)
 		       (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
 		printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
 	}
+#ifdef MICA_ADAPTIVE
+	if (adaptive_opts.enabled)
+		print_adaptive_summary();
+#endif
 
 	return 0;
 }

@@ -40,6 +40,7 @@ struct nf_config;
  * (locked tables, 15-byte FlowIds); drop_full drops packets of new flows
  * when a shard is full instead of forwarding them untranslated. */
 bool nf_init(uint16_t nb_shards, bool shared, bool drop_full);
+extern uint64_t nf_flows_allocated, nf_flows_failed, nf_already_translated;
 struct FlowManager *nf_shard(uint16_t shard);
 extern struct nf_config config;
 void nf_config_init(int argc, char **argv);

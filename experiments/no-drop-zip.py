@@ -226,6 +226,9 @@ def launch_program(base_command, queue, policy, additional_args):
         # Aspetta "ready" con timeout
         if process._ready_event.wait(timeout=15):
             tqdm.write("✅ Programma pronto (ready signal ricevuto)")
+            # common/qbitstream.h: which Open-NIC variant is loaded
+            m = re.search(r'^bitstream: .*$', process._output, re.M)
+            tqdm.write(m.group(0) if m else "bitstream: not printed by the app")
             return process
         else:
             tqdm.write("⚠️ Timeout: 'ready' non ricevuto entro 15s")
@@ -579,6 +582,137 @@ for app, command in (('nf-chain', EXPERIMENTS['nf-chain']['base_command']),
 EXPERIMENTS['mica-ring256'] = dict(EXPERIMENTS['mica'], policies=["aggressive"], queues=[64, 512],
                                    repetitions=2, zipf_skews=[0.6], additional_args="-d 256")
 
+# C2H descriptor prefetch (QDMA devarg desc_prefetch=1, every RX queue) on the
+# low-skew points, to compare with results_<app>_skew0.6
+for app in ('nf-chain', 'mica'):
+    assert "-a 0000:16:00.1 " in EXPERIMENTS[app]['base_command']
+    EXPERIMENTS[f'{app}-pfch'] = dict(
+        EXPERIMENTS[app], policies=["baseline", "aggressive"], queues=[1, 4, 32, 128, 512, 1024], zipf_skews=[0.6],
+        base_command=EXPERIMENTS[app]['base_command'].replace("-a 0000:16:00.1 ", "-a 0000:16:00.1,desc_prefetch=1 "))
+
+# The single-core points on Marco's QDMA PMD (../dpdk20.11-marco: per-lcore
+# completion scratch, reordered qdma_rx_queue, poll_hot mirror): <app>-marco-drv
+# is the unmodified app on that PMD, <app>-marco-pf also calls
+# rte_pmd_qdma_rx_queue_probe_many() before every sweep, as a prefetch of the
+# write-back pidx of the queues (nf-chain-marco/, mica-marco/). The results of
+# <app>-marco come from the removed variant that polled only the queues the
+# probe found non-empty
+for app in ('nf-chain', 'mica'):
+    binary = f"{REPO}/{app}/build/{app} "
+    assert binary in EXPERIMENTS[app]['base_command']
+    for name in (f'{app}-marco-drv', f'{app}-marco-pf'):
+        EXPERIMENTS[name] = dict(
+            EXPERIMENTS[app],
+            base_command=EXPERIMENTS[app]['base_command'].replace(binary, f"{REPO}/{app}-marco/build/{name} "))
+# the same two on the corrected MICA (mica-marco/Makefile, -DMICA_TRUE_FIFO -DMICA_NO_VALUE_COPY),
+# and ../mica/main.c with the probe (MICA_MARCO_PROBE), alone and with MICA's request pipeline
+# mica-marco-bisect-{A,B} (built by hand on 21 Oct): the main.c of mica-marco with
+# ../mica/ported-mica, and ../mica/main.c with mica-marco/ported-mica, to find
+# which of the two makes the current MICA write ~10 cold lines per packet
+for name in ('mica-marco-fifo-nocopy-drv', 'mica-marco-fifo-nocopy-pf',
+             'mica-marco-fifo-nocopy-probe', 'mica-marco-fifo-nocopy-probe-prefetch',
+             'mica-marco-bisect-A', 'mica-marco-bisect-B',
+             'mica-marco-bisect-V1', 'mica-marco-bisect-V2', 'mica-marco-bisect-V3'):
+    EXPERIMENTS[name] = dict(
+        EXPERIMENTS['mica'],
+        base_command=EXPERIMENTS['mica']['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica-marco/build/{name} "))
+
+# Why MICA gains less than nf-chain from more queues: variants of the port
+# (mica/Makefile). -fifo really evicts FIFO on a single core (the default moves
+# the 1.4 KB item to the log head on every GET), -nocopy does not copy the
+# 1400-byte value into the RX buffer (25 lines per buffer instead of ~3, so the
+# rings outgrow the LLC at ~16 queues instead of ~128). Run with mica itself
+# under the same --tag, queue count by queue count.
+for variant in ('fifo', 'nocopy', 'fifo-nocopy'):
+    EXPERIMENTS[f'mica-{variant}'] = dict(
+        EXPERIMENTS['mica'], policies=["aggressive"], queues=[1, 16, 64, 512], zipf_skews=[0.6],
+        base_command=EXPERIMENTS['mica']['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-{variant} "))
+# the multicore experiments of the paper on the same variant (the multicore
+# table was already FIFO: there only the copy changes)
+for name in [n for n in EXPERIMENTS if n.startswith(('mica-shared', 'mica-partitioned'))]:
+    EXPERIMENTS[name.replace('mica-', 'mica-fifo-nocopy-', 1)] = dict(
+        EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fifo-nocopy "))
+# Why 2 cores fall below 1 on mica-fifo-nocopy: every SET of every lcore locks
+# the single log pool while it writes the 1400-byte value. -pools gives each
+# lcore its own pool, -pools-padlock also gives each Shared queue lock its own
+# cache lines (16 packed locks share a line that every trylock writes)
+for variant in ('pools', 'pools-padlock'):
+    for name in [n for n in EXPERIMENTS if n.startswith(('mica-shared', 'mica-partitioned'))]:
+        EXPERIMENTS[name.replace('mica-', f'mica-fifo-nocopy-{variant}-', 1)] = dict(
+            EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+                f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fifo-nocopy-{variant} "))
+# -pools-affinity: Shared where every lcore owns the Partitioned slice and polls
+# another lcore's queues only while it has spare capacity and the owner is
+# backlogged (sharing a flow across lcores costs ~2x in the table)
+for name in [n for n in EXPERIMENTS if n.startswith('mica-shared')]:
+    EXPERIMENTS[name.replace('mica-', 'mica-fifo-nocopy-pools-affinity-', 1)] = dict(
+        EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fifo-nocopy-pools-affinity "))
+# the same two multicore tables with MICA's request pipeline (mica/Makefile)
+for name in [n for n in EXPERIMENTS if n.startswith('mica-partitioned')]:
+    EXPERIMENTS[name.replace('mica-', 'mica-fifo-nocopy-pools-prefetch-', 1)] = dict(
+        EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fifo-nocopy-pools-prefetch "))
+for name in [n for n in EXPERIMENTS if n.startswith('mica-shared')]:
+    # the paper's Shared: every lcore polls every queue
+    EXPERIMENTS[name.replace('mica-', 'mica-fifo-nocopy-pools-padlock-prefetch-', 1)] = dict(
+        EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fifo-nocopy-pools-padlock-prefetch "))
+    EXPERIMENTS[name.replace('mica-', 'mica-fifo-nocopy-pools-affinity-prefetch-', 1)] = dict(
+        EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fifo-nocopy-pools-affinity-prefetch "))
+# mica-fwd: the same polling loop forwarding without MICA, the ceiling of the
+# NIC and the PMD (4 cores with MICA stop at ~8.8 Mpps on 64 queues with idle cycles)
+for name in [n for n in EXPERIMENTS if n.startswith(('mica-shared', 'mica-partitioned'))]:
+    EXPERIMENTS[name.replace('mica-', 'mica-fwd-', 1)] = dict(
+        EXPERIMENTS[name], base_command=EXPERIMENTS[name]['base_command'].replace(
+            f"{REPO}/mica/build/mica ", f"{REPO}/mica/build/mica-fwd "))
+# bound of a perfect policy without either cost. TRex on one core tops out at
+# ~7.9 Mpps and this variant loses 1.6% there and nothing at 7.4. Near the max
+# one TRex core cannot keep the requested rate and reports queue full, so with
+# the default q_full_resolution (2%) no trial counts as passed and the search
+# repeated 98.3% of the max rate (stopped after 84 iterations on 18 Oct). Here
+# only the loss counts: the result is the highest lossless rate one TRex core
+# sends (~7.4 Mpps), a lower bound of the real one (below 7.9)
+EXPERIMENTS['mica-fifo-nocopy-seq-ring8192'] = dict(
+    EXPERIMENTS['mica-seq-ring8192'], base_command=EXPERIMENTS['mica-fifo-nocopy']['base_command'],
+    q_full_resolution=100.0, max_iterations=15)
+# the same with the default 1024-descriptor ring (as mica-seq)
+EXPERIMENTS['mica-fifo-nocopy-seq'] = dict(
+    EXPERIMENTS['mica-seq'], base_command=EXPERIMENTS['mica-fifo-nocopy']['base_command'],
+    q_full_resolution=100.0, max_iterations=15)
+# One TRex core sends this profile at only ~7.4 Mpps (α 0.6) and ~6.5 (α 0.9),
+# below what MICA takes: two cores, each following the chain with half of
+# every train, so a burst holds at most the flows the two cores are on (two,
+# adjacent in the sequence while they stay in step), an approximate bound
+EXPERIMENTS['mica-fifo-nocopy-seq-trex2'] = dict(
+    EXPERIMENTS['mica-fifo-nocopy-seq'], trex_core_mask=[0b11], repetitions=1)
+# MICA's request pipeline on mica-fifo-nocopy (mica/Makefile): the policies
+# stop at ~63% of the bound with the same instructions per packet, the rest is
+# L3 latency of the 1.4 KB items. -prefetch prefetches bucket then item (2
+# lines, MICA's own functions)
+for variant in ('prefetch',):
+    EXPERIMENTS[f'mica-fifo-nocopy-{variant}'] = dict(
+        EXPERIMENTS['mica-fifo-nocopy'], base_command=EXPERIMENTS['mica-fifo-nocopy']['base_command'].replace(
+            f"{REPO}/mica/build/mica-fifo-nocopy ", f"{REPO}/mica/build/mica-fifo-nocopy-{variant} "))
+    EXPERIMENTS[f'mica-fifo-nocopy-{variant}-seq-trex2'] = dict(
+        EXPERIMENTS['mica-fifo-nocopy-seq-trex2'],
+        base_command=EXPERIMENTS[f'mica-fifo-nocopy-{variant}']['base_command'])
+
+# Marco's PMD with the probe on the multicore MICA (Partitioned):
+# mica-marco-fifo-nocopy-pools-probe-prefetch is ../mica/main.c built as
+# mica-fifo-nocopy-pools-prefetch with MICA_MARCO_PROBE (mica-marco/Makefile)
+for c in (2, 4):
+    name = f'mica-marco-fifo-nocopy-pools-probe-prefetch-partitioned{c}'
+    EXPERIMENTS[name] = dict(
+        EXPERIMENTS[f'mica-fifo-nocopy-pools-prefetch-partitioned{c}'],
+        base_command=EXPERIMENTS[f'mica-fifo-nocopy-pools-prefetch-partitioned{c}']['base_command'].replace(
+            f"{REPO}/mica/build/mica-fifo-nocopy-pools-prefetch ",
+            f"{REPO}/mica-marco/build/mica-marco-fifo-nocopy-pools-probe-prefetch "))
+    assert "-marco" in EXPERIMENTS[name]['base_command'], name
 
 def main():
     parser = argparse.ArgumentParser(description="Zero-loss throughput (RFC2544 NDR) with TRex")
@@ -630,6 +764,8 @@ def main():
             additional_args = cmd_config.get('additional_args', '')
             profile_file = cmd_config.get('profile', PROFILE_FILE)
             core_mask = cmd_config.get('trex_core_mask')
+            q_full_resolution = cmd_config.get('q_full_resolution', 2.0)  # ndr_bench's default
+            max_iterations = cmd_config.get('max_iterations', 100)
 
             for zipf_skew in zipf_skews:
                 tqdm.write(f"\n{'='*80}")
@@ -686,7 +822,8 @@ def main():
                     cores=1,
                     iteration_duration=20.0,
                     first_run_duration=20.0,
-                    max_iterations=100,
+                    q_full_resolution=q_full_resolution,
+                    max_iterations=max_iterations,
                     pdr=0.1, #0.2 0.09 
                     pdr_error=0.1, 
                     bi_dir=False,

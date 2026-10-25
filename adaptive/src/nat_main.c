@@ -13,6 +13,8 @@ struct nf_config config;
 static struct FlowManager **nat_shards;
 static uint16_t nat_shard_count;
 static bool drop_when_full;
+uint64_t nf_flows_allocated, nf_flows_failed; /* new flows, and those that found the table full */
+uint64_t nf_already_translated; /* packets whose source is already the NAT's external address */
 
 bool nf_init(uint16_t nb_shards, bool shared, bool drop_full) {
 
@@ -171,13 +173,24 @@ int nf_process(struct FlowManager *flow_manager, uint16_t device,
         NF_DEBUG("Device %" PRIu16 " is internal (not %" PRIu16 ")", device,
                  config.wan_device);
 
+        /* Our own output received again (the QDMA hands back translated
+         * packets under overload): not a flow. Without this check every one
+         * took a NAT entry, which never expire, until the table was full and
+         * every lookup of a missing flow scanned all of it. */
+        if (ip_src == config.external_addr) {
+            nf_already_translated++;
+            return config.wan_device;
+        }
         uint16_t external_port;
         if (!flow_manager_get_internal(flow_manager, &id, now,
                                        &external_port)) {
             NF_DEBUG("New flow");
 
-            if (!flow_manager_allocate_flow(flow_manager, &id, device, now,
-                                            &external_port)) {
+            if (flow_manager_allocate_flow(flow_manager, &id, device, now,
+                                           &external_port)) {
+                nf_flows_allocated++;
+            } else {
+                nf_flows_failed++;
                 NF_DEBUG("No space for the flow");
                 if (drop_when_full)
                     return EXPLICIT_DROP;

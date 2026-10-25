@@ -36,6 +36,25 @@
  * drains a backlog with full polls without losing anything. The epoch after
  * every change is discarded, to let the drained queues empty and the caches
  * warm up.
+ *
+ * With --adaptive-search, two of these rules change, for gains that need
+ * several doublings (Aggressive with many flows: 1 -> 2 queues gains a few
+ * percent or nothing, 1 -> 128 tens of percent):
+ *  - a grow that did not help but did not raise the cycles per packet by more
+ *    than threshold either (flat) is not undone at once: the controller jumps
+ *    from the same base twice as far (1, 2, 4, 8 octaves) and judges again
+ *    against the base, and undoes the grow back to the base only when a jump
+ *    is worse or the next one would pass max;
+ *  - trying fewer queues is not stopped by the hold of a flap, but it is
+ *    judged as well: a shrink that raises the cycles per packet by more than
+ *    threshold while the share stays above backlog-high is undone, and
+ *    trying fewer stops for hold epochs (doubled as the vetoes);
+ *  - after ADAPTIVE_PROBE_EPOCHS without moves with the share between
+ *    backlog-low and backlog-high (no signal), halve the queues: a load that
+ *    fell leaves the controller on many queues, whose deep rings add tens of
+ *    ms of latency (Aggressive on 1024 queues at 3.5 Mpps and 1000 flows: p99
+ *    6 ms, against 46 us on 1 queue). A grow within the flap window makes it a
+ *    flap, so a probe that fails holds the next one off (hold, doubled).
  */
 #pragma once
 
@@ -59,6 +78,7 @@
 #define ADAPTIVE_FLAP_WINDOW 10    /* epochs */
 #define ADAPTIVE_FLAP_RESET 600    /* epochs without moves that forget the flaps */
 #define ADAPTIVE_FLAP_MAX_SHIFT 3  /* hold grows up to 8x */
+#define ADAPTIVE_PROBE_EPOCHS 20   /* --adaptive-search: epochs without signal before halving */
 
 struct adaptive_opts {
 	bool     enabled;
@@ -71,6 +91,7 @@ struct adaptive_opts {
 	uint32_t epoch_ms;      /* measurement epoch */
 	uint32_t threshold_pct; /* cost drop that makes a grow worth keeping */
 	uint32_t hold;          /* epochs without growing or shrinking after a veto or a flap */
+	bool     search;        /* multi-octave grows and judged shrinks (see above) */
 };
 
 #define ADAPTIVE_OPT "adaptive"
@@ -83,6 +104,7 @@ struct adaptive_opts {
 #define ADAPTIVE_OPT_BACKLOG_HIGH "adaptive-backlog-high"
 #define ADAPTIVE_OPT_BACKLOG_LOW "adaptive-backlog-low"
 #define ADAPTIVE_OPT_SNAPSHOT "snapshot-ms"
+#define ADAPTIVE_OPT_SEARCH "adaptive-search"
 
 #define ADAPTIVE_LONG_OPTIONS                                                                      \
 	{ADAPTIVE_OPT, no_argument, 0, 0}, {ADAPTIVE_OPT_START, required_argument, 0, 0},              \
@@ -93,6 +115,7 @@ struct adaptive_opts {
 	    {ADAPTIVE_OPT_EMPTY_HIGH, required_argument, 0, 0},                                        \
 	    {ADAPTIVE_OPT_BACKLOG_HIGH, required_argument, 0, 0},                                      \
 	    {ADAPTIVE_OPT_BACKLOG_LOW, required_argument, 0, 0},                                       \
+	    {ADAPTIVE_OPT_SEARCH, no_argument, 0, 0},                                                  \
 	{                                                                                              \
 		ADAPTIVE_OPT_SNAPSHOT, required_argument, 0, 0                                             \
 	}
@@ -109,6 +132,9 @@ struct adaptive_opts {
 	"  --" ADAPTIVE_OPT_BACKLOG_HIGH " PCT: double when more than PCT percent of the full "         \
 	"polls leave half the ring waiting (default 5)\n"                                              \
 	"  --" ADAPTIVE_OPT_BACKLOG_LOW " PCT: halve below PCT percent (default 0.5)\n"                \
+	"  --" ADAPTIVE_OPT_SEARCH ": a flat grow jumps 2, 4, 8 octaves before it is undone, "         \
+	"trying fewer queues is judged instead of held, and a count without signal is probed lower "  \
+	"(see adaptive.h)\n"                                                                          \
 	"  --" ADAPTIVE_OPT_SNAPSHOT " MS: every MS ms, print the packets waiting in every active queue " \
 	"and the next polls (queue, packets), also without --adaptive (default 0, off)\n"
 
@@ -153,6 +179,10 @@ adaptive_parse_long_opt(struct adaptive_opts *o, const char *name, const char *a
 
 	if (strcmp(name, ADAPTIVE_OPT) == 0) {
 		o->enabled = true;
+		return 1;
+	}
+	if (strcmp(name, ADAPTIVE_OPT_SEARCH) == 0) {
+		o->search = true;
 		return 1;
 	}
 	if (strcmp(name, ADAPTIVE_OPT_START) != 0 && strcmp(name, ADAPTIVE_OPT_MIN) != 0 &&
@@ -270,6 +300,14 @@ struct adaptive_ctl {
 	bool     check_grow; /* the next measured epoch judges the last grow */
 	double   grow_cost;  /* cycles per packet before the last grow */
 	double   grow_share; /* backlog share before the last grow */
+	unsigned grow_from;  /* log2 before the last grow, where a veto goes back */
+	/* --adaptive-search */
+	bool     search;
+	unsigned grow_step;   /* octaves of the current jump from grow_from */
+	bool     check_fewer; /* the next measured epoch judges the last try-fewer */
+	double   fewer_cost;  /* cycles per packet before it */
+	unsigned fewer_from;
+	uint32_t no_fewer;    /* epochs left without trying fewer */
 };
 
 static inline void
@@ -288,6 +326,28 @@ adaptive_ctl_init(struct adaptive_ctl *c,
 	c->backlog_high = o->backlog_high_pct / 100.0;
 	c->backlog_low  = o->backlog_low_pct / 100.0;
 	c->last_empty   = c->last_backlog = -1.0;
+	c->search       = o->search;
+}
+
+static inline unsigned
+adaptive_backoff(struct adaptive_ctl *c)
+{
+	const unsigned shift = c->flaps < ADAPTIVE_FLAP_MAX_SHIFT ? c->flaps : ADAPTIVE_FLAP_MAX_SHIFT;
+
+	c->flaps++;
+	return c->hold << shift;
+}
+
+/* a move decided by a judgement, not by the signals: no flap bookkeeping */
+static inline unsigned
+adaptive_jump(struct adaptive_ctl *c, unsigned log, int dir)
+{
+	c->cur_log    = log;
+	c->last_move  = dir;
+	c->since_move = 0;
+	c->settle     = true;
+	c->changes++;
+	return c->cur_log;
 }
 
 /*
@@ -309,6 +369,8 @@ adaptive_epoch(struct adaptive_ctl *c, uint64_t polls, uint64_t empty, double ba
 		c->no_shrink--;
 	if (c->no_grow > 0)
 		c->no_grow--;
+	if (c->no_fewer > 0)
+		c->no_fewer--;
 	if (c->since_move >= ADAPTIVE_FLAP_RESET)
 		c->flaps = 0;
 	if (c->settle) {
@@ -329,50 +391,63 @@ adaptive_epoch(struct adaptive_ctl *c, uint64_t polls, uint64_t empty, double ba
 		c->check_grow = false;
 		if (backlog > c->backlog_high && backlog >= c->grow_share &&
 		    cost > c->grow_cost * (1.0 - c->threshold)) {
-			const unsigned shift =
-			    c->flaps < ADAPTIVE_FLAP_MAX_SHIFT ? c->flaps : ADAPTIVE_FLAP_MAX_SHIFT;
+			const unsigned next = c->grow_from + 2 * c->grow_step;
 
-			c->flaps++;
-			c->no_grow    = c->hold << shift;
-			c->cur_log    = c->cur_log - 1;
-			c->last_move  = -1;
-			c->since_move = 0;
-			c->settle     = true;
-			c->changes++;
-			return c->cur_log;
+			if (c->search && cost <= c->grow_cost * (1.0 + c->threshold) && next <= c->max_log) {
+				/* flat: jump twice as far from the same base */
+				c->grow_step *= 2;
+				c->check_grow = true;
+				return adaptive_jump(c, next, +1);
+			}
+			c->no_grow = adaptive_backoff(c);
+			return adaptive_jump(c, c->grow_from, -1);
+		}
+	}
+	/* the first epoch after trying fewer: was it worse? */
+	if (c->check_fewer) {
+		c->check_fewer = false;
+		if (backlog > c->backlog_high && cost > c->fewer_cost * (1.0 + c->threshold)) {
+			c->no_fewer = adaptive_backoff(c);
+			return adaptive_jump(c, c->fewer_from, +1);
 		}
 	}
 
+	bool fewer = false;
+
 	if (backlog > c->backlog_high && c->cur_log < c->max_log && c->no_grow == 0)
 		move = +1;
-	else if (backlog > c->backlog_high && c->no_grow > 0 && c->cur_log > c->min_log)
-		move = -1; /* more queues did not help: try fewer */
-	else if ((e > c->empty_high || backlog < c->backlog_low) && c->cur_log > c->min_log)
+	else if (backlog > c->backlog_high && c->no_grow > 0 && c->cur_log > c->min_log &&
+	         c->no_fewer == 0) {
+		move  = -1; /* more queues did not help: try fewer */
+		fewer = true;
+	} else if ((e > c->empty_high || backlog < c->backlog_low) && c->cur_log > c->min_log)
 		move = -1;
+	else if (c->search && backlog <= c->backlog_high && c->cur_log > c->min_log &&
+	         c->since_move >= ADAPTIVE_PROBE_EPOCHS)
+		move = -1; /* no signal for a while: probe fewer queues */
 	if (move == 0)
 		return c->cur_log;
 
 	if (move < 0 && c->last_move > 0 && c->since_move <= ADAPTIVE_FLAP_WINDOW)
 		return c->cur_log; /* right after a grow: let it settle */
-	if (move < 0 && c->no_shrink > 0)
+	if (move < 0 && c->no_shrink > 0 && !(c->search && fewer))
 		return c->cur_log;
+	if (c->search && fewer) {
+		c->check_fewer = true;
+		c->fewer_cost  = cost;
+		c->fewer_from  = c->cur_log;
+	}
 	if (move > 0 && c->last_move < 0 && c->since_move <= ADAPTIVE_FLAP_WINDOW) {
 		/* flap: the last shrink was one too many, stop shrinking for a while */
-		const unsigned shift = c->flaps < ADAPTIVE_FLAP_MAX_SHIFT ? c->flaps : ADAPTIVE_FLAP_MAX_SHIFT;
-
-		c->flaps++;
-		c->no_shrink = c->hold << shift;
+		c->no_shrink = adaptive_backoff(c);
 	}
 
 	if (move > 0) {
 		c->check_grow = true;
 		c->grow_cost  = cost;
 		c->grow_share = backlog;
+		c->grow_from  = c->cur_log;
+		c->grow_step  = 1;
 	}
-	c->cur_log    = (unsigned)((int)c->cur_log + move);
-	c->last_move  = move;
-	c->since_move = 0;
-	c->settle     = true;
-	c->changes++;
-	return c->cur_log;
+	return adaptive_jump(c, (unsigned)((int)c->cur_log + move), move);
 }

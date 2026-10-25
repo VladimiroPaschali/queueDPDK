@@ -4,6 +4,7 @@
 
 #include "rte_pmd_qdma.h"
 #include "qflow.h"
+#include "qbitstream.h"
 #include "nat_flowmanager.h"
 #include "utils/vigor-time.h"
 #include "nat_main.h"
@@ -1958,7 +1959,6 @@ poll_loop(const enum qflow_mode mode)
 					                 acl_search.num_ipv6,
 					                 DEFAULT_MAX_CATEGORIES);
 				}
-
 				if (mode == QFLOW_SINGLE) {
 					uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
 					for (int j = nb_tx; j < nb_rx; j++)
@@ -2817,6 +2817,9 @@ main(int argc, char **argv)
 			printf("wrong bitstream\n");
 			return 0;
 		}
+
+		// which variant: C2H prefetch cache and completion coalescing depth
+		qbitstream_print(dev);
 
 		struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
 		int                             i, j;

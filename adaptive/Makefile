@@ -5,7 +5,7 @@ APP = adaptive
 
 SRCS-y := $(wildcard src/*.c)
 SRCS-y += $(wildcard src/utils/*.c)
-HDRS := $(wildcard src/*.h) $(wildcard src/utils/*.h) ../common/qflow.h
+HDRS := $(wildcard src/*.h) $(wildcard src/utils/*.h) ../common/qflow.h ../common/qbitstream.h
 
 # Static build against the patched DPDK 20.11 tree (QDMA PMD), which the
 # application calls directly.

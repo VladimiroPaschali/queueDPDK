@@ -5,7 +5,7 @@ APP = mica
 
 SRCS-y := main.c
 SRCS-y += $(wildcard ported-mica/*.c)
-HDRS := $(wildcard ported-mica/*.h) ../common/qflow.h
+HDRS := $(wildcard ported-mica/*.h) ../common/qflow.h ../common/qbitstream.h
 
 # Static build against the patched DPDK 20.11 tree (QDMA PMD), which the
 # application calls directly.
@@ -71,6 +71,16 @@ build/$(APP)-fifo-nocopy-pools-prefetch: CFLAGS += -DMICA_TRUE_FIFO -DMICA_NO_VA
 build/$(APP)-fifo-nocopy-pools-affinity-prefetch: CFLAGS += -DMICA_TRUE_FIFO -DMICA_NO_VALUE_COPY \
 	-DMICA_POOL_PER_LCORE -DMEHCACHED_MULTI_ALLOC -DMICA_PADDED_QUEUE_LOCKS -DMICA_SHARED_AFFINITY \
 	-DMICA_BATCH_PREFETCH
+# Adaptive queue count (../adaptive/src/adaptive.h) on the single-core MICA of
+# latency.py (-prefetch-lat: the TRex latency trailer comes back intact), for
+# adaptive.py --app mica; qdma_rss.c needs the PMD's private headers
+QDMA_SRC := $(DPDK_LOCAL_PATH)/drivers/net/qdma
+VARIANTS += build/$(APP)-fifo-nocopy-prefetch-adaptive
+HDRS += ../adaptive/src/adaptive.h ../adaptive/src/qdma_rss.h ../adaptive/src/qdma_rss.c
+build/$(APP)-fifo-nocopy-prefetch-adaptive: SRCS-y += ../adaptive/src/qdma_rss.c
+build/$(APP)-fifo-nocopy-prefetch-adaptive: CFLAGS += -DMICA_TRUE_FIFO -DMICA_NO_VALUE_COPY -DMICA_KEEP_PAYLOAD \
+	-DMICA_BATCH_PREFETCH -DMICA_ADAPTIVE -I../adaptive/src \
+	-I$(QDMA_SRC) -I$(QDMA_SRC)/qdma_access -I$(QDMA_SRC)/qdma_access/qdma_soft_access
 
 all: build/$(APP) $(VARIANTS)
 

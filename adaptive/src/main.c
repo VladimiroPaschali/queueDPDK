@@ -4,6 +4,7 @@
 
 #include "rte_pmd_qdma.h"
 #include "qflow.h"
+#include "qbitstream.h"
 #include "adaptive.h"
 #include "qdma_rss.h"
 #include "nat_flowmanager.h"
@@ -1566,6 +1567,11 @@ print_stats(void)
 	       sec_full ? 100.0 * (double)sec_backlog_half / (double)sec_full : 0.0);
 	sec_polls = sec_empty = sec_full = sec_busy_cycles = sec_cycles = 0;
 	sec_backlog_max = sec_backlog_half = 0;
+	printf("nat: %" PRIu64 " flows allocated, %" PRIu64 " packets of new flows found the table full, %" PRIu64
+	       " packets already translated (not looked up)\n",
+	       nf_flows_allocated,
+	       nf_flows_failed,
+	       nf_already_translated);
 	if (snap_ready) {
 		printf("snapshot: tsc_ms=%.1f queues=%u backlog=",
 		       (double)snap_tsc * 1e3 / rte_get_timer_hz(), snap_queues);
@@ -1942,9 +1948,10 @@ print_adaptive_summary(void)
  * Polling loop on a single lcore: sweeps the polled queues, prints statistics
  * every second, sends each burst on TX queue 0 and measures throughput after a
  * 3 s warmup. Penalty and Aggressive apply to the active queues; queues being
- * drained after a shrink are polled every sweep. With --adaptive, the
- * controller runs at the end of every epoch on the cycles of the non-idle
- * sweeps.
+ * drained after a shrink are polled every sweep. With --latency-queue, every
+ * latency-period regular polls one poll goes to the queue of the latency flow
+ * among the active ones. With --adaptive, the controller runs at the end of
+ * every epoch on the cycles of the non-idle sweeps.
  */
 static int
 poll_loop(void)
@@ -1967,6 +1974,13 @@ poll_loop(void)
 	uint64_t       epoch_full = 0, epoch_half = 0;
 	uint32_t       sweep_half = 0;
 	uint32_t       sweep_pkts = 0, sweep_polls = 0, sweep_empty = 0, sweep_full = 0;
+
+	/* Latency: every latency_period regular polls, one poll of the queue the
+	 * NIC steers the latency flow to, as in nf-chain */
+	const bool latency_mode   = qflow.latency;
+	const int  latency_period = qflow.latency_period;
+	int        latency_count  = 0, resume_i = -1;
+	bool       inject_queue   = false;
 
 	struct countmin    *cms          = cm_per_core[lcore_id];
 	struct FlowManager *flow_manager = nf_shard(0);
@@ -2038,6 +2052,10 @@ poll_loop(void)
 		const int  active_end = active_queues;
 		bool       drained    = true;
 		const bool draining   = sweep_end > active_end;
+		/* --latency-queue names the queue with -q queues: the NIC steers with
+		 * hash & (active - 1), so with fewer active queues the flow is on its
+		 * low bits */
+		const int latency_queue = latency_mode ? qflow.latency_queue & (active_end - 1) : -1;
 
 		if (unlikely(snap_period > 0) && !snap_capturing && !snap_ready && cur_tsc >= snap_next) {
 			for (int q = 0; q < active_end; q++)
@@ -2051,11 +2069,17 @@ poll_loop(void)
 		}
 
 		for (i = 0; i < sweep_end; ++i) {
-			const bool drain_queue = i >= active_end;
+			bool drain_queue = i >= active_end;
 
 			if (!drain_queue && (penalty > 0) && (hit[i] < penalty)) {
 				hit[i]++;
 				continue;
+			}
+			if (unlikely(inject_queue)) {
+				resume_i     = i;
+				i            = latency_queue;
+				inject_queue = false;
+				drain_queue  = false;
 			}
 
 			nb_rx = rte_eth_rx_burst(rx_port, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
@@ -2113,7 +2137,21 @@ poll_loop(void)
 				}
 			}
 
-			if (!drain_queue) {
+			/* a latency poll is not a poll of the sweep: no Penalty, Aggressive
+			 * or controller statistics, and i goes back into the sweep */
+			bool latency_poll = false;
+			if (latency_mode) {
+				if (resume_i != -1 && i == latency_queue) {
+					i            = resume_i - 1;
+					resume_i     = -1;
+					latency_poll = true;
+				} else if (!drain_queue && i != latency_queue && ++latency_count == latency_period) {
+					latency_count = 0;
+					inject_queue  = true;
+				}
+			}
+
+			if (!drain_queue && !latency_poll) {
 				sweep_polls++;
 				sweep_empty += nb_rx == 0;
 				if (nb_rx == MAX_PKT_BURST) {
@@ -2792,8 +2830,8 @@ main(int argc, char **argv)
 	nb_lcores = rte_lcore_count();
 	if (qflow_check(&qflow, queues, nb_lcores) < 0)
 		rte_exit(EXIT_FAILURE, "Invalid policy configuration\n");
-	if (nb_lcores != 1 || qflow.mode != QFLOW_SINGLE || qflow.latency)
-		rte_exit(EXIT_FAILURE, "adaptive runs on one lcore, without --latency-queue\n");
+	if (nb_lcores != 1 || qflow.mode != QFLOW_SINGLE)
+		rte_exit(EXIT_FAILURE, "adaptive runs on one lcore\n");
 	if (queues > MAX_RX_QUEUE_PER_PORT)
 		rte_exit(EXIT_FAILURE, "at most %u queues\n", MAX_RX_QUEUE_PER_PORT);
 	if (adaptive_check(&adaptive_opts, queues) < 0)
@@ -2815,6 +2853,10 @@ main(int argc, char **argv)
 		       adaptive_opts.backlog_high_pct,
 		       adaptive_opts.empty_high_pct,
 		       adaptive_opts.backlog_low_pct);
+	if (adaptive_opts.enabled && adaptive_opts.search)
+		printf("Adaptive search: a flat grow jumps 2, 4, 8 octaves before it is undone, "
+		       "trying fewer queues is judged, no signal for %u epochs probes fewer\n",
+		       ADAPTIVE_PROBE_EPOCHS);
 
 	if (check_lcore_params() < 0)
 		rte_exit(EXIT_FAILURE, "check_lcore_params failed\n");
@@ -2898,6 +2940,8 @@ main(int argc, char **argv)
 			printf("wrong bitstream\n");
 			return 0;
 		}
+		// which variant: C2H prefetch cache and completion coalescing depth
+		qbitstream_print(dev);
 
 		struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
 		int                             i, j;

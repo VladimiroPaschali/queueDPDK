@@ -4,6 +4,7 @@ per-packet perf events measured at the NDR rate, against the number of queues.
 
   python3 plot_ndr.py                  # every results/ndr/results_<experiment>_skew* found
   python3 plot_ndr.py --apps nf-chain  # only the NF chain
+  python3 plot_ndr.py --apps nf-chain-partitioned4  # every policy on 4 cores
 
 Writes PDF and PNG into plots/ndr/:
   <app>_<metric>             single core, one panel per trace, one line per policy
@@ -302,11 +303,14 @@ def main():
     print(f"experiments: {', '.join(sorted(data)) or 'none'}")
 
     for app in args.apps:
+        # one line per policy; a multicore experiment (<app>-partitioned4)
+        # also works, its title then names no cores
         lines = single_lines(data, app)
         if lines:
+            title = app if re.search(r"-(shared|partitioned)\d+$", app) else f"{app}, 1 core"
             for metric in METRICS:
-                plot_metric(lines, metric, f"{app}, 1 core", args.out, f"{app}_{metric}")
-            plot_overview(lines, list(METRICS), f"{app}, 1 core", args.out, f"{app}_overview")
+                plot_metric(lines, metric, title, args.out, f"{app}_{metric}")
+            plot_overview(lines, list(METRICS), title, args.out, f"{app}_overview")
         for mode in ("shared", "partitioned"):
             lines = multicore_lines(data, app, mode)
             if len(lines) < 2:
