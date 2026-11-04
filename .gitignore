@@ -7,12 +7,12 @@
 *.log
 *.all_results.csv
 *.csv
-*asni-mica/*
 *.cache/*
 *benchmark_averages.csv
 *perf.data*
 QueueDPDK.md
 QueueDPDK.pdf
 CLAUDE.local.md
+experiments/results/
 experiments/plots/
 experiments/logs/
