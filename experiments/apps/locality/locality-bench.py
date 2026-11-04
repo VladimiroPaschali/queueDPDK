@@ -5,9 +5,9 @@ Lancia TRex con profilo Zipf a throughput fisso, avvia l'app DPDK locality
 per catturare le 5-tuple per queue, poi esegue la flow analysis offline.
 
 Parametri via CLI:
-  --queues   lista di num. code  (default: 1 8 64 256 512)
+  --queues   lista di num. code  (default: 1 2 4 ... 2048)
   --skews    lista di skew Zipf  (default: 0.1 0.6 0.9)
-  --pps      throughput fisso    (default: 1000000)
+  --pps      throughput fisso    (default: 30000000)
   --flows    numero flussi Zipf  (default: 10000)
   --size     dimensione pacchetto(default: 64)
   --keep-raw conserva il file raw dopo l'analisi
@@ -35,16 +35,19 @@ from trex.stl.api import STLClient, STLProfile
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
-PROFILE_FILE  = os.path.join(os.path.dirname(__file__), "../experiments/zipf-profile.py")
+HERE          = os.path.dirname(os.path.abspath(__file__))
+EXPERIMENTS   = os.path.abspath(os.path.join(HERE, "..", ".."))
+RESULTS_DIR   = os.path.join(EXPERIMENTS, "results", "locality")
+PROFILE_FILE  = os.path.join(EXPERIMENTS, "zipf-profile.py")
 DPDK_BASE_CMD = (
-    "sudo /home/vladimiro/dpdk_patched/queueDPDK/locality/build/cms"
+    f"sudo {HERE}/build/cms"
     " -d librte_net_qdma.so -l 4 -n 4 -a 16:00.1 --"
     " -P 1 -T 1 -d 1024 -c 1048576 -p 0"
 )
 TREX_SERVER   = "100.78.72.16"
 PORTS         = [0]
 
-# ── Analysis (da locality/analysis/locality.py) ───────────────────────────────
+# ── Analysis ──────────────────────────────────────────────────────────────────
 
 def burst_analysis(filename: str, output_csv: str) -> int:
     """Raggruppa le righe per burst_id (col 0) e calcola per ogni burst:
@@ -324,7 +327,8 @@ def main() -> None:
     tqdm.write(f"Throughput: {throughput:,} pps")
     tqdm.write(f"Flows:      {num_flows:,}  |  Pkt size: {pkt_size} B")
 
-    summary_csv = "locality_summary.csv"
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    summary_csv = os.path.join(RESULTS_DIR, "locality_summary.csv")
     if os.path.isfile(summary_csv):
         os.remove(summary_csv)
 
@@ -360,7 +364,7 @@ def main() -> None:
             for queue in queues_list:
                 pbar.set_description(f"[skew:{skew:.2f} | Q:{queue:4d}]")
 
-                results_dir = os.path.join("results_locality", f"skew{skew}_q{queue}")
+                results_dir = os.path.join(RESULTS_DIR, f"skew{skew}_q{queue}")
                 os.makedirs(results_dir, exist_ok=True)
 
                 raw_file   = os.path.join(results_dir, "flows_raw.txt")
@@ -401,7 +405,7 @@ def main() -> None:
                 pbar.update(1)
 
         pbar.close()
-        tqdm.write(f"\nRisultati salvati in results_locality/  |  sommario: {summary_csv}")
+        tqdm.write(f"\nRisultati salvati in {RESULTS_DIR}/  |  sommario: {summary_csv}")
 
     finally:
         set_governor("schedutil")

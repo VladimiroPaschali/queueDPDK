@@ -5,7 +5,6 @@
 
 #include <assert.h>
 #include <rte_ethdev.h>
-#include <rte_spinlock.h>
 #include <stdlib.h>
 #include <string.h> //for memcpy
 #include <stdbool.h>
@@ -31,8 +30,7 @@ flow_manager_allocate(uint16_t starting_port, uint32_t nat_ip,
                                               show that internal != external;
                                               can be removed once "our NAT" ==
                                               router + "only NAT" */
-                      uint32_t expiration_time, uint64_t max_flows,
-                      bool shared);
+                      uint32_t expiration_time, uint64_t max_flows);
 
 bool flow_manager_allocate_flow(struct FlowManager *manager, struct FlowId *id,
                                 uint16_t internal_device, vigor_time_t time,

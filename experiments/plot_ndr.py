@@ -10,12 +10,10 @@ Writes PDF and PNG into plots/ndr/:
   <app>_<metric>             single core, one panel per trace, one line per policy
                              (paper Fig. 3, 5 and 8)
   <app>_overview             the same, every metric in one grid
-  <app>-<multicore>_<metric> Shared/Partitioned, one line per core count; the
+  <app>-partitioned_<metric> Partitioned, one line per core count; the
                              1-core line is the single-core aggressive+penalty run
-                             (paper Fig. 7 and 9)
-  <app>-<multicore>_overview the same, every metric in one grid
-  <app>_shared_vs_partitioned
-                             Shared vs Partitioned at 64 queues, 2 cores (Fig. 10)
+                             (multicore figure)
+  <app>-partitioned_overview the same, every metric in one grid
 
 Repetitions whose NDR search failed (final drop > 0.2%) are left out.
 Lines are the mean over repetitions, the band is ±1 standard deviation.
@@ -47,7 +45,7 @@ STYLES = [
     dict(color="#eda100", marker="D", dash=(6, 2, 1, 2)),
 ]
 POLICIES = ["baseline", "aggressive", "penalty", "aggressive+penalty"]
-CORES = [1, 2, 4, 8]
+CORES = [1, 2, 4]
 SKEWS = {"0.1": "Uniform", "0.6": "Low skew (α = 0.6)", "0.9": "High skew (α = 0.9)"}
 NDR_FAILED_DROP_PCT = 0.2
 INK = "#0b0b0b"
@@ -260,36 +258,6 @@ def plot_overview(lines, metrics, title, out_dir, name):
     save(fig, out_dir, name)
 
 
-def plot_shared_vs_partitioned(data, app, out_dir, queue=64, cores=2):
-    modes = [("Partitioned", f"{app}-partitioned{cores}", STYLES[0]),
-             ("Shared", f"{app}-shared{cores}", STYLES[1])]
-    skews = [s for s in SKEWS if any(s in data.get(e, {}) for _, e, _ in modes)]
-    if not skews:
-        return
-    metrics = ["throughput", "cycles", "l1_misses", "dram_bytes"]
-    fig, axes = plt.subplots(1, len(metrics), figsize=(2.8 * len(metrics), 2.6))
-    width = 0.38
-    for ax, metric in zip(axes, metrics):
-        for i, (label, exp, style) in enumerate(modes):
-            for j, skew in enumerate(skews):
-                rows = data.get(exp, {}).get(skew, {}).get(("aggressive+penalty", queue), [])
-                s = stat(rows, metric) if rows else None
-                if not s:
-                    continue
-                x = j + (i - 0.5) * width
-                ax.bar(x, s[0], width - 0.04, color=style["color"], edgecolor="white", lw=0)
-                ax.errorbar(x, s[0], yerr=s[1], color=INK_2, lw=0.8, capsize=2)
-        ax.set_xticks(range(len(skews)))
-        ax.set_xticklabels([SKEWS[s].split(" (")[0] for s in skews], fontsize=7)
-        ax.set_ylabel(METRICS[metric][0], fontsize=8)
-        ax.grid(axis="x", visible=False)
-    handles = [plt.Rectangle((0, 0), 1, 1, color=s["color"], label=l) for l, _, s in modes]
-    fig.tight_layout(rect=(0, 0, 1, 0.86))
-    fig.legend(handles=handles, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 0.97), fontsize=8)
-    fig.suptitle(f"{app}: {queue} queues, {cores} cores, aggressive+penalty", y=1.02, fontsize=9, color=INK)
-    save(fig, out_dir, f"{app}_shared_vs_partitioned")
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", default=os.path.join(HERE, "results", "ndr"),
@@ -307,11 +275,11 @@ def main():
         # also works, its title then names no cores
         lines = single_lines(data, app)
         if lines:
-            title = app if re.search(r"-(shared|partitioned)\d+$", app) else f"{app}, 1 core"
+            title = app if re.search(r"-partitioned\d+$", app) else f"{app}, 1 core"
             for metric in METRICS:
                 plot_metric(lines, metric, title, args.out, f"{app}_{metric}")
             plot_overview(lines, list(METRICS), title, args.out, f"{app}_overview")
-        for mode in ("shared", "partitioned"):
+        for mode in ("partitioned",):
             lines = multicore_lines(data, app, mode)
             if len(lines) < 2:
                 continue
@@ -320,7 +288,6 @@ def main():
             for metric in metrics:
                 plot_metric(lines, metric, title, args.out, f"{app}-{mode}_{metric}")
             plot_overview(lines, metrics, title, args.out, f"{app}-{mode}_overview")
-        plot_shared_vs_partitioned(data, app, args.out)
     print(f"Plots in {args.out}/")
 
 

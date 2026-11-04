@@ -7,16 +7,13 @@ struct nf_config config;
 
 /*
  * The flow table is split into shards, each owning a disjoint range of
- * external ports: one shard on a single core, one per lcore with Partitioned,
- * one per RX queue with Shared.
+ * external ports: one shard on a single core, one per lcore with Partitioned.
  */
 static struct FlowManager **nat_shards;
 static uint16_t nat_shard_count;
 static bool drop_when_full;
-uint64_t nf_flows_allocated, nf_flows_failed; /* new flows, and those that found the table full */
-uint64_t nf_already_translated; /* packets whose source is already the NAT's external address */
 
-bool nf_init(uint16_t nb_shards, bool shared, bool drop_full) {
+bool nf_init(uint16_t nb_shards, bool drop_full) {
 
     // Setups the configuration
     config.start_port = 1024;
@@ -68,7 +65,7 @@ bool nf_init(uint16_t nb_shards, bool shared, bool drop_full) {
         const uint32_t shard_flows = base_flows + (shard < remainder ? 1U : 0U);
         nat_shards[shard] = flow_manager_allocate(
             (uint16_t)shard_start, config.external_addr, config.wan_device,
-            config.expiration_time, shard_flows, shared);
+            config.expiration_time, shard_flows);
         if (nat_shards[shard] == NULL) {
             return false;
         }
@@ -173,24 +170,13 @@ int nf_process(struct FlowManager *flow_manager, uint16_t device,
         NF_DEBUG("Device %" PRIu16 " is internal (not %" PRIu16 ")", device,
                  config.wan_device);
 
-        /* Our own output received again (the QDMA hands back translated
-         * packets under overload): not a flow. Without this check every one
-         * took a NAT entry, which never expire, until the table was full and
-         * every lookup of a missing flow scanned all of it. */
-        if (ip_src == config.external_addr) {
-            nf_already_translated++;
-            return config.wan_device;
-        }
         uint16_t external_port;
         if (!flow_manager_get_internal(flow_manager, &id, now,
                                        &external_port)) {
             NF_DEBUG("New flow");
 
-            if (flow_manager_allocate_flow(flow_manager, &id, device, now,
-                                           &external_port)) {
-                nf_flows_allocated++;
-            } else {
-                nf_flows_failed++;
+            if (!flow_manager_allocate_flow(flow_manager, &id, device, now,
+                                            &external_port)) {
                 NF_DEBUG("No space for the flow");
                 if (drop_when_full)
                     return EXPLICIT_DROP;

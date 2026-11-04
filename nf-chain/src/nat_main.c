@@ -7,14 +7,13 @@ struct nf_config config;
 
 /*
  * The flow table is split into shards, each owning a disjoint range of
- * external ports: one shard on a single core, one per lcore with Partitioned,
- * one per RX queue with Shared.
+ * external ports: one shard on a single core, one per lcore with Partitioned.
  */
 static struct FlowManager **nat_shards;
 static uint16_t nat_shard_count;
 static bool drop_when_full;
 
-bool nf_init(uint16_t nb_shards, bool shared, bool drop_full) {
+bool nf_init(uint16_t nb_shards, bool drop_full) {
 
     // Setups the configuration
     config.start_port = 1024;
@@ -66,7 +65,7 @@ bool nf_init(uint16_t nb_shards, bool shared, bool drop_full) {
         const uint32_t shard_flows = base_flows + (shard < remainder ? 1U : 0U);
         nat_shards[shard] = flow_manager_allocate(
             (uint16_t)shard_start, config.external_addr, config.wan_device,
-            config.expiration_time, shard_flows, shared);
+            config.expiration_time, shard_flows);
         if (nat_shards[shard] == NULL) {
             return false;
         }

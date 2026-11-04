@@ -5,8 +5,7 @@
 #include "rte_pmd_qdma.h"
 #include "qflow.h"
 #include "qbitstream.h"
-#include "adaptive.h"
-#include "qdma_rss.h"
+#include "qprobe.h"
 #include "nat_flowmanager.h"
 #include "utils/vigor-time.h"
 #include "nat_main.h"
@@ -51,7 +50,6 @@
 #include <rte_udp.h>
 #include <rte_string_fns.h>
 #include <rte_acl.h>
-#include <rte_spinlock.h>
 
 #include <cmdline_parse.h>
 #include <cmdline_parse_etheraddr.h>
@@ -64,23 +62,29 @@
 
 #define RTE_LOGTYPE_L3FWD RTE_LOGTYPE_USER1
 
-/* Exported by the patched QDMA PMD (qdma_platform.c), not by its headers */
-uint32_t qdma_reg_read_usr(void *dev_hndl, uint32_t reg_offst);
-void     qdma_reg_write_usr(void *dev_hndl, uint32_t reg_offst, uint32_t val);
-
 #define MAX_JUMBO_PKT_LEN 9600
 
 #define MEMPOOL_CACHE_SIZE 256
 #define HASHFN_N 16
 
-/* Count-Min Sketch: 16 rows of 1M counters reached through a row-pointer table */
+/*
+ * Count-Min Sketch. Single core uses 16 rows of 1M counters reached
+ * through a row-pointer table; Partitioned uses 16 rows of 64K counters
+ * embedded in one block. Each lcore owns its sketch.
+ */
 #define CMS_COLUMNS 1048576
+#define CMS_COLUMNS_PARTITIONED 65536
 
 struct countmin {
 	uint64_t **values;
 };
 
-static struct countmin *cm_per_core[RTE_MAX_LCORE];
+struct countmin_partitioned {
+	uint64_t values[HASHFN_N][CMS_COLUMNS_PARTITIONED];
+};
+
+static struct countmin             *cm_per_core[RTE_MAX_LCORE];
+static struct countmin_partitioned *cm_part_per_core[RTE_MAX_LCORE];
 static volatile bool force_quit;
 
 /*
@@ -98,6 +102,7 @@ static volatile bool force_quit;
 
 #define MAX_PKT_BURST 32
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
+#define TX_BATCH_SIZE 512      /* multicore: max TX pkts accumulated across queues per sweep */
 
 #define NB_SOCKETS 8
 
@@ -113,36 +118,12 @@ static uint16_t nb_rxd     = RTE_TEST_RX_DESC_DEFAULT;
 static uint16_t nb_txd     = RTE_TEST_TX_DESC_DEFAULT;
 static uint16_t          queues = 2;
 static struct qflow_opts qflow;
-/* Adaptive queue count (see adaptive.h) */
-static struct adaptive_opts adaptive_opts;
-static struct adaptive_ctl  adaptive_ctl;
-static uint32_t             rss_mask_reg = UINT32_MAX;
-static uint16_t             rx_port;       /* port whose queues are polled */
-static uint16_t             active_queues; /* queues the NIC steers to */
-static uint16_t             polled_queues; /* active_queues plus those still draining */
-static uint64_t             drain_until;   /* tsc before which draining queues stay polled */
-/* Polls of the active queues in the current second, and the cycles of the
- * sweeps that found work (printed by print_stats, also without --adaptive) */
-static uint64_t sec_polls, sec_empty, sec_full, sec_busy_cycles, sec_cycles;
-/* Backlog left in a queue after a full poll, in the current second: largest
- * and how many full polls left more than half the ring */
-static uint32_t sec_backlog_max, sec_backlog_half;
-
-/* Queue snapshots (--snapshot-ms): the packets waiting in every active queue
- * at the start of a sweep, then the queue and the packets of the next
- * SNAP_POLLS polls that returned packets (empty polls skipped, counted);
- * printed by print_stats, outside the timed sweeps */
-#define SNAP_POLLS 48
-static uint64_t snap_period, snap_next, snap_tsc;
-static uint16_t snap_backlog[1u << ADAPTIVE_MAX_LOG];
-static uint16_t snap_queues, snap_npolls;
-static uint32_t snap_empty;
-static uint16_t snap_poll_q[SNAP_POLLS], snap_poll_n[SNAP_POLLS];
-static bool     snap_capturing, snap_ready;
-static uint16_t rx_ring_size = 1;
 /* Policy knobs read by the polling loop, derived from qflow */
 static bool     aggressive = false;
 static uint32_t penalty    = 0; /* 0 disables Penalty */
+/* qprobe log (see qprobe.h) */
+static const char *qp_log_path = NULL;
+static uint64_t    qp_records  = 8u << 20;
 bool            verbose    = false;
 uint32_t        empty      = 0;
 uint32_t        total      = 0;
@@ -223,6 +204,7 @@ static struct rte_eth_conf port_conf = {
         },
 };
 
+/* Single core uses pool 0; Partitioned has one pool per lcore */
 struct rte_mempool *pktmbuf_pool[RTE_MAX_LCORE] = {NULL};
 
 /* ethernet addresses of ports */
@@ -284,6 +266,8 @@ send_single_packet(struct rte_mbuf *m, uint16_t port);
 #define OPTION_RULE_IPV6 "rule_ipv6"
 #define OPTION_ALG "alg"
 #define OPTION_ETH_DEST "eth-dest"
+#define OPTION_QP_LOG "log"
+#define OPTION_QP_RECORDS "log-records"
 #define ACL_DENY_SIGNATURE 0xf0000000
 #define RTE_LOGTYPE_L3FWDACL RTE_LOGTYPE_USER3
 #define acl_log(format, ...) RTE_LOG(ERR, L3FWDACL, format, ##__VA_ARGS__)
@@ -1459,7 +1443,7 @@ is_valid_ipv4_pkt(struct rte_ipv4_hdr *pkt, uint32_t link_len)
 	return 0;
 }
 #endif
-/* Per-queue Penalty counters */
+/* Single core: per-queue Penalty counters (multicore keeps them per lcore) */
 int queue_hit[MAX_RX_QUEUE_PER_LCORE] = {1};
 static void
 print_stats(void)
@@ -1557,37 +1541,6 @@ print_stats(void)
 	n_bursts  = 0;
 	n_pkts    = 0;
 	qflow_print(&qflow, queues);
-	printf("poll mix: active polls %" PRIu64 ", empty %.1f%%, full %.1f%%, busy %.3f, "
-	       "backlog max %.1f%%, over half %.3f%%\n",
-	       sec_polls,
-	       sec_polls ? 100.0 * (double)sec_empty / (double)sec_polls : 0.0,
-	       sec_polls ? 100.0 * (double)sec_full / (double)sec_polls : 0.0,
-	       sec_cycles ? (double)sec_busy_cycles / (double)sec_cycles : 0.0,
-	       100.0 * sec_backlog_max / rx_ring_size,
-	       sec_full ? 100.0 * (double)sec_backlog_half / (double)sec_full : 0.0);
-	sec_polls = sec_empty = sec_full = sec_busy_cycles = sec_cycles = 0;
-	sec_backlog_max = sec_backlog_half = 0;
-	printf("nat: %" PRIu64 " flows allocated, %" PRIu64 " packets of new flows found the table full, %" PRIu64
-	       " packets already translated (not looked up)\n",
-	       nf_flows_allocated,
-	       nf_flows_failed,
-	       nf_already_translated);
-	if (snap_ready) {
-		printf("snapshot: tsc_ms=%.1f queues=%u backlog=",
-		       (double)snap_tsc * 1e3 / rte_get_timer_hz(), snap_queues);
-		for (unsigned q = 0; q < snap_queues; q++)
-			if (snap_backlog[q])
-				printf("%u:%u,", q, snap_backlog[q]);
-		printf(" polls=");
-		for (unsigned k = 0; k < snap_npolls; k++)
-			printf("%u:%u,", snap_poll_q[k], snap_poll_n[k]);
-		printf(" empty=%u\n", snap_empty);
-		snap_ready = false;
-	}
-	printf("RSS queues: %u (polled %u)", active_queues, polled_queues);
-	if (adaptive_opts.enabled)
-		printf(", adaptive signal, %" PRIu64 " changes", adaptive_ctl.changes);
-	printf("\n");
 	printf("\n====================================================\n");
 	// if (after_warmup)
 	// 	measured_packets_rx += (total_packets_rx - total_packets_rx_prev);
@@ -1705,7 +1658,7 @@ check_packet_magic(struct rte_mbuf *m, uint32_t expected_magic)
 }
 
 static __rte_always_inline void
-count_add(struct rte_mbuf *m, struct countmin *cms)
+count_add(struct rte_mbuf *m, const enum qflow_mode mode, void *cms)
 {
 	struct rte_ether_hdr *eth;
 	eth             = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
@@ -1751,9 +1704,14 @@ count_add(struct rte_mbuf *m, struct countmin *cms)
 
 	// --- calcolo hash sui campi della 5-tuple ---
 	for (int i = 0; i < HASHFN_N; i++) {
-		uint64_t h          = xxhash64((const char *)&key, sizeof(key), i);
-		uint32_t target_idx = h & (CMS_COLUMNS - 1);
-		cms->values[i][target_idx]++;
+		uint64_t h = xxhash64((const char *)&key, sizeof(key), i);
+		if (mode == QFLOW_PARTITIONED) {
+			uint32_t target_idx = h & (CMS_COLUMNS_PARTITIONED - 1);
+			((struct countmin_partitioned *)cms)->values[i][target_idx]++;
+		} else {
+			uint32_t target_idx = h & (CMS_COLUMNS - 1);
+			((struct countmin *)cms)->values[i][target_idx]++;
+		}
 	}
 }
 
@@ -1762,8 +1720,9 @@ static __rte_always_inline int
 nf_process_burst(struct rte_mbuf   **pkts_burst,
                  int                 nb_pkts,
                  uint16_t            portid,
+                 const enum qflow_mode mode,
                  struct FlowManager *flow_manager,
-                 struct countmin    *cms)
+                 void               *cms)
 {
 	for (int i = 0; i < nb_pkts; i++) {
 
@@ -1803,311 +1762,171 @@ nf_process_burst(struct rte_mbuf   **pkts_burst,
 		           port_dst,
 		           current_time());
 
-		count_add(pkts_burst[i], cms);
+		count_add(pkts_burst[i], mode, cms);
 	}
 	return 0;
 }
 
-/***********************adaptive queue count******************************/
-
-/* After a shrink, the dropped queues are polled for at least this long */
-#define DRAIN_MIN_US 200
-
-static uint32_t
-rss_reta_first(uint16_t portid)
-{
-	struct rte_eth_rss_reta_entry64 reta_conf[2048 / RTE_RETA_GROUP_SIZE];
-	struct rte_eth_dev_info         dev_info;
-
-	if (rte_eth_dev_info_get(portid, &dev_info) != 0)
-		return UINT32_MAX;
-	for (unsigned i = 0; i < RTE_DIM(reta_conf); i++)
-		reta_conf[i].mask = ~0ULL;
-	if (rte_eth_dev_rss_reta_query(portid, reta_conf, dev_info.reta_size) != 0)
-		return UINT32_MAX;
-	return reta_conf[0].reta[0];
-}
-
 /*
- * The mask register is 16 bits wide: the upper half reads as 0xdead, and the
- * first read after startup returned garbage (0xdeadbeff) while the following
- * ones were stable, so read twice and keep the low half, as the PMD does when
- * it stores the value in a 16-bit RETA entry.
+ * Polling loop. mode is a constant in each main_loop_* wrapper, so the
+ * compiler emits one specialised loop per multicore policy:
+ *  - single core: polls every queue, prints statistics every second, sends
+ *    each burst on TX queue 0 and measures throughput after a 3 s warmup;
+ *  - Partitioned: polls a contiguous slice of queues, batches TX on its own
+ *    TX queue.
+ * Penalty, Aggressive and Latency apply on top of both.
  */
-static uint32_t
-rss_mask_read(struct rte_eth_dev *dev, uint32_t reg)
+static __rte_always_inline int
+poll_loop(const enum qflow_mode mode)
 {
-	(void)qdma_reg_read_usr(dev, reg);
-	return qdma_reg_read_usr(dev, reg) & 0xffff;
-}
+	struct rte_mbuf   *pkts_burst[MAX_PKT_BURST];
+	struct rte_mbuf   *tx_batch[TX_BATCH_SIZE];
+	int                queue_hit_local[MAX_RX_QUEUE_PER_LCORE] __rte_cache_aligned;
+	unsigned           lcore_id;
+	uint64_t           prev_tsc, diff_tsc, cur_tsc = 0, timer_tsc, end_warmup = 0;
+	int                i, nb_rx;
+	uint16_t           portid;
+	struct lcore_conf *qconf;
+	int                socketid;
+	timer_tsc = 0;
+	prev_tsc  = 0;
+	lcore_id  = rte_lcore_id();
+	qconf     = &lcore_conf[lcore_id];
+	socketid  = rte_lcore_to_socket_id(lcore_id);
+	int ret;
 
-/*
- * The mask register is the one qdma_dev_reta_update() writes, at the address
- * the PMD derives from its func_id (qdma_rss.c); no other address is touched.
- * Check that it holds queues - 1, as programmed by rte_eth_dev_rss_reta_update(),
- * and that a change to it shows up in rte_eth_dev_rss_reta_query(), then
- * restore it.
- */
-static int
-rss_mask_locate(uint16_t portid, uint16_t queues)
-{
-	struct rte_eth_dev *dev   = &rte_eth_devices[portid];
-	const uint32_t      reg   = qdma_rss_mask_reg(portid);
-	const uint32_t      probe = queues / 2 - 1;
-	const uint32_t      old   = rss_mask_read(dev, reg);
-	uint32_t            seen;
-
-	if (old != queues - 1u) {
-		printf("RSS mask register 0x%x holds %u, expected %u\n", reg, old, queues - 1u);
-		return -1;
-	}
-	qdma_reg_write_usr(dev, reg, probe);
-	seen = rss_reta_first(portid);
-	qdma_reg_write_usr(dev, reg, old);
-	if (seen != probe) {
-		printf("RSS mask register 0x%x: wrote %u, reta query read %u\n", reg, probe, seen);
-		return -1;
-	}
-	rss_mask_reg = reg;
-	return 0;
-}
-
-/*
- * Change the number of queues the NIC steers to. Growing starts polling the
- * new queues before the NIC fills them. Shrinking keeps polling the dropped
- * queues until a sweep finds them empty after DRAIN_MIN_US (see poll_loop),
- * so no packet is left in a ring nobody reads. A flow that changes queue can
- * be reordered once, between its old backlog and its new packets.
- */
-static void
-set_active_queues(uint16_t n, uint64_t now)
-{
-	struct rte_eth_dev *dev = &rte_eth_devices[rx_port];
-
-	if (n > active_queues) {
-		/* the new queues are polled on the next sweep */
-		for (uint16_t q = active_queues; q < n; q++)
-			queue_hit[q] = penalty;
-		active_queues = n;
-		if (polled_queues < n)
-			polled_queues = n;
-		qdma_reg_write_usr(dev, rss_mask_reg, n - 1u);
-	} else if (n < active_queues) {
-		qdma_reg_write_usr(dev, rss_mask_reg, n - 1u);
-		active_queues = n;
-		drain_until   = now + DRAIN_MIN_US * rte_get_timer_hz() / US_PER_S;
-	}
-}
-
-static void
-adaptive_step(uint64_t now,
-              uint64_t cycles,
-              uint64_t pkts,
-              uint64_t polls,
-              uint64_t empty_polls,
-              double   backlog_share)
-{
-	const unsigned prev = adaptive_ctl.cur_log;
-	const unsigned next =
-	    adaptive_epoch(&adaptive_ctl, polls, empty_polls, backlog_share, cycles, pkts);
-
-	if (next == prev)
-		return;
-	set_active_queues((uint16_t)(1u << next), now);
-	printf("adaptive: %u -> %u queues after signal epoch: %.1f cycles/pkt (base %.1f), "
-	       "empty %.1f%%, backlog share %.2f%%\n",
-	       1u << prev,
-	       1u << next,
-	       pkts ? (double)cycles / (double)pkts : 0.0,
-	       adaptive_ctl.grow_cost,
-	       100.0 * adaptive_ctl.last_empty,
-	       100.0 * adaptive_ctl.last_backlog);
-}
-
-static void
-print_adaptive_summary(void)
-{
-	uint64_t total_epochs = 0;
-
-	for (unsigned l = 0; l <= ADAPTIVE_MAX_LOG; l++)
-		total_epochs += adaptive_ctl.epochs[l];
-	printf("\nadaptive: %" PRIu64 " changes, final %u queues, epochs per queue count:\n",
-	       adaptive_ctl.changes,
-	       active_queues);
-	for (unsigned l = 0; l <= ADAPTIVE_MAX_LOG; l++)
-		if (adaptive_ctl.epochs[l])
-			printf("adaptive: %4u queues %8" PRIu64 " (%6.2f%%)\n",
-			       1u << l,
-			       adaptive_ctl.epochs[l],
-			       100.0 * (double)adaptive_ctl.epochs[l] / (double)total_epochs);
-}
-
-/***********************end of adaptive queue count******************************/
-
-/*
- * Polling loop on a single lcore: sweeps the polled queues, prints statistics
- * every second, sends each burst on TX queue 0 and measures throughput after a
- * 3 s warmup. Penalty and Aggressive apply to the active queues; queues being
- * drained after a shrink are polled every sweep. With --latency-queue, every
- * latency-period regular polls one poll goes to the queue of the latency flow
- * among the active ones. With --adaptive, the controller runs at the end of
- * every epoch on the cycles of the non-idle sweeps.
- */
-static int
-poll_loop(void)
-{
-	struct rte_mbuf *pkts_burst[MAX_PKT_BURST];
-	unsigned         lcore_id;
-	uint64_t         prev_tsc, diff_tsc, cur_tsc = 0, timer_tsc, end_warmup = 0;
-	int              i, nb_rx;
-	int              socketid;
-	int              ret;
-	int             *hit = queue_hit;
-	lcore_id             = rte_lcore_id();
-	socketid             = rte_lcore_to_socket_id(lcore_id);
-	timer_tsc            = 0;
-
-	const bool     adaptive     = adaptive_opts.enabled;
-	const uint64_t epoch_period = (uint64_t)adaptive_opts.epoch_ms * rte_get_timer_hz() / MS_PER_S;
-	uint64_t       epoch_tsc = 0, epoch_cycles = 0, epoch_pkts = 0;
-	uint64_t       epoch_polls = 0, epoch_empty = 0;
-	uint64_t       epoch_full = 0, epoch_half = 0;
-	uint32_t       sweep_half = 0;
-	uint32_t       sweep_pkts = 0, sweep_polls = 0, sweep_empty = 0, sweep_full = 0;
-
-	/* Latency: every latency_period regular polls, one poll of the queue the
-	 * NIC steers the latency flow to, as in nf-chain */
 	const bool latency_mode   = qflow.latency;
 	const int  latency_period = qflow.latency_period;
-	int        latency_count  = 0, resume_i = -1;
+	const int  latency_queue  = qflow.latency_queue;
+	int        latency_count  = 0;
 	bool       inject_queue   = false;
+	int        resume_i       = -1;
 
-	struct countmin    *cms          = cm_per_core[lcore_id];
-	struct FlowManager *flow_manager = nf_shard(0);
+	unsigned total_lcores = rte_lcore_count();
+	unsigned lcore_pos    = 0;
+	unsigned iter_lcore   = 0;
+	RTE_LCORE_FOREACH(iter_lcore)
+	{
+		if (iter_lcore == lcore_id)
+			break;
+		lcore_pos++;
+	}
+
+	int queue_start = 0;
+	int queue_end   = queues;
+	if (mode == QFLOW_PARTITIONED) {
+		queue_start = (int)(((uint32_t)queues * lcore_pos) / total_lcores);
+		queue_end   = (int)(((uint32_t)queues * (lcore_pos + 1)) / total_lcores);
+	}
+	const bool     has_latency_queue = latency_queue >= queue_start && latency_queue < queue_end;
+	const uint16_t tx_queueid        = (uint16_t)lcore_pos;
+
+	/* Penalty counters: global on a single core, per lcore otherwise */
+	int *hit = (mode == QFLOW_SINGLE) ? queue_hit : queue_hit_local;
+	if (mode != QFLOW_SINGLE)
+		for (i = 0; i < queue_end - queue_start; i++)
+			queue_hit_local[i] = penalty;
+
+	uint16_t rx_portid = RTE_MAX_ETHPORTS;
+	if (mode != QFLOW_SINGLE) {
+		if (qconf->n_rx_queue > 0)
+			rx_portid = qconf->rx_queue_list[0].port_id;
+		for (portid = 0; rx_portid >= RTE_MAX_ETHPORTS && portid < RTE_MAX_ETHPORTS; portid++)
+			if ((enabled_port_mask & (1u << portid)) != 0)
+				rx_portid = portid;
+		if (rx_portid >= RTE_MAX_ETHPORTS) {
+			RTE_LOG(ERR, L3FWD, "no enabled port found for lcore %u\n", lcore_id);
+			return -1;
+		}
+	}
+
+	void *cms = (mode == QFLOW_PARTITIONED) ? (void *)cm_part_per_core[lcore_id]
+	                                        : (void *)cm_per_core[lcore_id];
+	struct FlowManager *flow_manager = nf_shard(mode == QFLOW_PARTITIONED ? lcore_pos : 0);
 
 	printf("ready\n");
 	RTE_LOG(INFO, L3FWD, "entering main loop on lcore %u\n", lcore_id);
+	if (mode != QFLOW_SINGLE) {
+		RTE_LOG(INFO, L3FWD, "lcore %u queue range [%d, %d)\n", lcore_id, queue_start, queue_end);
+		RTE_LOG(INFO, L3FWD, "lcore %u tx queue %u\n", lcore_id, tx_queueid);
+	}
 	fflush(stdout);
 
 	uint64_t start_time  = rte_rdtsc();
 	uint64_t warmup_time = 3 * rte_get_timer_hz();
 	uint64_t stop_time   = (10 * rte_get_timer_hz()) + warmup_time;
-	prev_tsc             = start_time;
 
 	while (!force_quit) {
-		bool slow_path = false;
 
-		cur_tsc  = rte_rdtsc();
-		diff_tsc = cur_tsc - prev_tsc;
-		/* the previous sweep counts for the controller only if it found work */
-		/* poll outcomes of the active queues, also only in sweeps that found
-		 * work: an idle core spinning on empty queues is not wasting them */
-		if (sweep_pkts > 0) {
-			epoch_cycles += diff_tsc;
-			epoch_pkts += sweep_pkts;
-			sec_busy_cycles += diff_tsc;
-			epoch_polls += sweep_polls;
-			epoch_empty += sweep_empty;
-			epoch_full += sweep_full;
-			epoch_half += sweep_half;
-			sec_polls += sweep_polls;
-			sec_empty += sweep_empty;
-			sec_full += sweep_full;
-			sweep_pkts = 0;
-		}
-		sec_cycles += diff_tsc;
-		sweep_polls = sweep_empty = sweep_full = sweep_half = 0;
-		/* if timer is enabled */
-		if (timer_period > 0) {
-			/* advance the timer */
-			timer_tsc += diff_tsc;
-			/* if timer has reached its timeout */
-			if (unlikely(timer_tsc >= timer_period)) {
-				print_stats();
-				/* reset the timer */
-				timer_tsc = 0;
-				slow_path = true;
+		if (mode == QFLOW_SINGLE) {
+			cur_tsc  = rte_rdtsc();
+			diff_tsc = cur_tsc - prev_tsc;
+			/* if timer is enabled */
+			if (timer_period > 0) {
+				/* advance the timer */
+				timer_tsc += diff_tsc;
+				/* if timer has reached its timeout */
+				if (unlikely(timer_tsc >= timer_period)) {
+					/* do this only on main core */
+					if (lcore_id == rte_get_main_lcore()) {
+						print_stats();
+						/* reset the timer */
+						timer_tsc = 0;
+					}
+				}
 			}
+			prev_tsc = cur_tsc;
 		}
-		if (adaptive) {
-			epoch_tsc += diff_tsc;
-			if (unlikely(epoch_tsc >= epoch_period)) {
-				adaptive_step(cur_tsc, epoch_cycles, epoch_pkts, epoch_polls, epoch_empty,
-				              epoch_full ? (double)epoch_half / (double)epoch_full : 0.0);
-				epoch_tsc    = 0;
-				epoch_cycles = 0;
-				epoch_pkts   = 0;
-				epoch_polls = epoch_empty = epoch_full = epoch_half = 0;
-				slow_path    = true;
-			}
-		}
-		/* keep statistics and controller time out of the next sweep */
-		prev_tsc = slow_path ? rte_rdtsc() : cur_tsc;
 
 		/*
 		 * Read packet from RX queues
 		 */
-		int        max_loops  = QFLOW_MAX_CONSECUTIVE_POLLS;
-		const int  sweep_end  = polled_queues;
-		const int  active_end = active_queues;
-		bool       drained    = true;
-		const bool draining   = sweep_end > active_end;
-		/* --latency-queue names the queue with -q queues: the NIC steers with
-		 * hash & (active - 1), so with fewer active queues the flow is on its
-		 * low bits */
-		const int latency_queue = latency_mode ? qflow.latency_queue & (active_end - 1) : -1;
+		int max_loops = QFLOW_MAX_CONSECUTIVE_POLLS;
+		int tx_total  = 0;
 
-		if (unlikely(snap_period > 0) && !snap_capturing && !snap_ready && cur_tsc >= snap_next) {
-			for (int q = 0; q < active_end; q++)
-				snap_backlog[q] = qdma_rx_backlog(rx_port, (uint16_t)q);
-			snap_queues    = (uint16_t)active_end;
-			snap_npolls    = 0;
-			snap_empty     = 0;
-			snap_tsc       = cur_tsc;
-			snap_next      = cur_tsc + snap_period;
-			snap_capturing = true;
-		}
+		for (i = queue_start; i < queue_end; ++i) {
+			/* Partitioned indexes its counters relative to its slice and
+			 * keeps that index across a latency diversion */
+			const int qi = i - queue_start;
 
-		for (i = 0; i < sweep_end; ++i) {
-			bool drain_queue = i >= active_end;
-
-			if (!drain_queue && (penalty > 0) && (hit[i] < penalty)) {
-				hit[i]++;
+			if ((penalty > 0) && (hit[qi] < penalty)) {
+				hit[qi]++;
 				continue;
 			}
-			if (unlikely(inject_queue)) {
+
+			if (latency_mode && has_latency_queue && inject_queue) {
 				resume_i     = i;
 				i            = latency_queue;
 				inject_queue = false;
-				drain_queue  = false;
 			}
 
-			nb_rx = rte_eth_rx_burst(rx_port, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
-			if (unlikely(snap_capturing) && nb_rx == 0) {
-				snap_empty++;
-			} else if (unlikely(snap_capturing)) {
-				snap_poll_q[snap_npolls] = (uint16_t)i;
-				snap_poll_n[snap_npolls] = (uint16_t)nb_rx;
-				if (++snap_npolls == SNAP_POLLS) {
-					snap_capturing = false;
-					snap_ready     = true;
-				}
+			if (mode == QFLOW_SINGLE)
+				portid = qconf->rx_queue_list[i].port_id;
+			else
+				portid = rx_portid;
+
+			nb_rx = rte_eth_rx_burst(portid, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
+			qp_poll(lcore_id, (uint16_t)i, pkts_burst, (uint16_t)nb_rx, MAX_PKT_BURST);
+			if (mode == QFLOW_SINGLE) {
+				n_bursts++;
+				n_pkts += nb_rx;
 			}
-			n_bursts++;
-			n_pkts += nb_rx;
-			sweep_pkts += nb_rx;
-			if (drain_queue && nb_rx > 0)
-				drained = false;
 
 			if (nb_rx > 0) {
 				struct acl_search_t acl_search;
 
 				prepare_acl_parameter(pkts_burst, &acl_search, nb_rx);
 
-				ret = nf_process_burst(pkts_burst, nb_rx, rx_port, flow_manager, cms);
+				ret = nf_process_burst(pkts_burst,
+				                       nb_rx,
+				                       portid,
+				                       mode,
+				                       flow_manager,
+				                       cms);
 				if (ret == 1) {
 					printf("stopping\n");
-					end_time = cur_tsc - end_warmup;
+					if (mode == QFLOW_SINGLE)
+						end_time = cur_tsc - end_warmup;
 					return 0; // received stop signal
 				}
 
@@ -2127,45 +1946,51 @@ poll_loop(void)
 					                 DEFAULT_MAX_CATEGORIES);
 				}
 
-				uint16_t nb_tx = rte_eth_tx_burst(rx_port, 0, pkts_burst, nb_rx);
-				for (int j = nb_tx; j < nb_rx; j++)
-					rte_pktmbuf_free(pkts_burst[j]);
+				if (mode == QFLOW_SINGLE) {
+					uint16_t nb_tx = rte_eth_tx_burst(portid, 0, pkts_burst, nb_rx);
+					for (int j = nb_tx; j < nb_rx; j++)
+						rte_pktmbuf_free(pkts_burst[j]);
 
-				port_statistics[rx_port][i].rx += nb_rx;
-				if (after_warmup) {
-					measured_packets_rx += nb_rx;
+					port_statistics[portid][i].rx += nb_rx;
+					if (after_warmup) {
+						measured_packets_rx += nb_rx;
+					}
+				} else {
+					/* Accumulate into tx_batch; flush early if nearly full */
+					if (unlikely(tx_total + nb_rx > TX_BATCH_SIZE)) {
+						uint16_t nb_tx = rte_eth_tx_burst(portid, tx_queueid, tx_batch, tx_total);
+						for (int j = nb_tx; j < tx_total; j++)
+							rte_pktmbuf_free(tx_batch[j]);
+						tx_total = 0;
+					}
+					rte_memcpy(&tx_batch[tx_total], pkts_burst, nb_rx * sizeof(struct rte_mbuf *));
+					tx_total += nb_rx;
 				}
 			}
 
-			/* a latency poll is not a poll of the sweep: no Penalty, Aggressive
-			 * or controller statistics, and i goes back into the sweep */
+			/* Penalty and Aggressive act on regular polls only: after a latency
+			 * poll i already points back into the sweep */
 			bool latency_poll = false;
-			if (latency_mode) {
+			if (latency_mode && has_latency_queue) {
+				/* back to the regular sweep after a latency poll */
 				if (resume_i != -1 && i == latency_queue) {
-					i            = resume_i - 1;
+					i            = resume_i - 1; // -1 per compensare i++
 					resume_i     = -1;
 					latency_poll = true;
-				} else if (!drain_queue && i != latency_queue && ++latency_count == latency_period) {
-					latency_count = 0;
-					inject_queue  = true;
+				}
+				/* count only regular queues */
+				else if (i != latency_queue) {
+					latency_count++;
+					if (latency_count == latency_period) {
+						latency_count = 0;
+						inject_queue  = true;
+					}
 				}
 			}
 
-			if (!drain_queue && !latency_poll) {
-				sweep_polls++;
-				sweep_empty += nb_rx == 0;
-				if (nb_rx == MAX_PKT_BURST) {
-					/* what the full burst left behind in the ring */
-					const uint32_t b = qdma_rx_backlog(rx_port, (uint16_t)i);
-
-					sweep_full++;
-					sweep_half += 2 * b > rx_ring_size;
-					if (b > sec_backlog_max)
-						sec_backlog_max = b;
-					sec_backlog_half += 2 * b > rx_ring_size;
-				}
+			if (!latency_poll) {
 				if (penalty > 0 && max_loops == QFLOW_MAX_CONSECUTIVE_POLLS)
-					hit[i] = penalty * (nb_rx > MAX_PKT_BURST / 2);
+					hit[mode == QFLOW_PARTITIONED ? qi : i] = penalty * (nb_rx > MAX_PKT_BURST / 2);
 
 				if (aggressive && nb_rx == MAX_PKT_BURST && max_loops > 0) {
 					i--;
@@ -2175,36 +2000,72 @@ poll_loop(void)
 				}
 			}
 
-			if (nb_rx < MAX_PKT_BURST) {
-				spin_time++;
-			}
-			spin_pkt += nb_rx;
-			if (nb_rx == 0) {
-				empty++;
+			if (mode == QFLOW_SINGLE) {
+				if (nb_rx < MAX_PKT_BURST) {
+					spin_time++;
+				}
+				spin_pkt += nb_rx;
+				if (nb_rx == 0) {
+					empty++;
+				}
 			}
 		}
 
-		/* the dropped queues are empty and the NIC no longer fills them */
-		if (draining && drained && cur_tsc >= drain_until)
-			polled_queues = active_queues;
+		/* Single TX for all packets collected across all queues this sweep */
+		if (mode != QFLOW_SINGLE && tx_total > 0) {
+			uint16_t nb_tx = rte_eth_tx_burst(rx_portid, tx_queueid, tx_batch, tx_total);
+			for (int j = nb_tx; j < tx_total; j++)
+				rte_pktmbuf_free(tx_batch[j]);
+		}
 
-		if ((cur_tsc - start_time) > stop_time) {
-			end_time = cur_tsc - end_warmup;
-		} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
-			printf("Warmup finished\n");
-			after_warmup = true;
-			end_warmup   = cur_tsc;
-			warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
+		if (mode == QFLOW_SINGLE) {
+			if ((cur_tsc - start_time) > stop_time) {
+				end_time = cur_tsc - end_warmup;
+			} else if (cur_tsc - start_time > warmup_time) { // 3 seconds
+				printf("Warmup finished\n");
+				after_warmup = true;
+				end_warmup   = cur_tsc;
+				warmup_time  = 1000 * rte_get_timer_hz(); // reset warmup time
+			}
 		}
 	}
-	end_time = rte_rdtsc() - end_warmup;
+	if (mode == QFLOW_SINGLE)
+		end_time = rte_rdtsc() - end_warmup;
 	return 0;
 }
 
 static int
-main_loop(__rte_unused void *dummy)
+main_loop_single(__rte_unused void *dummy)
 {
-	return poll_loop();
+	return poll_loop(QFLOW_SINGLE);
+}
+
+static int
+main_loop_partitioned(__rte_unused void *dummy)
+{
+	return poll_loop(QFLOW_PARTITIONED);
+}
+
+/* Partitioned: lcore that polls a given RX queue */
+static inline unsigned
+get_lcore_for_queue(unsigned queue_id, unsigned total_queues, unsigned total_lcores)
+{
+	unsigned lcore_pos = 0;
+	unsigned lcore_id;
+
+	RTE_LCORE_FOREACH(lcore_id)
+	{
+		unsigned queue_start = (total_queues * lcore_pos) / total_lcores;
+		unsigned queue_end   = (total_queues * (lcore_pos + 1)) / total_lcores;
+
+		if (queue_id >= queue_start && queue_id < queue_end)
+			return lcore_id;
+
+		lcore_pos++;
+	}
+
+	/* Fallback to first lcore */
+	return rte_lcore_id();
 }
 
 static int
@@ -2312,7 +2173,9 @@ print_usage(const char *prgname)
 	       "  -P : enable promiscuous mode\n"
 	       "  -q N: number of RX queues\n"
 	       "  -d N: RX descriptors per queue (power of 2, >= 64)\n"
-	       "  -v : print per-queue statistics\n" QFLOW_USAGE ADAPTIVE_USAGE
+	       "  -v : print per-queue statistics\n" QFLOW_USAGE
+	       "  --" OPTION_QP_LOG " FILE: write the qprobe log (marked packets) to FILE\n"
+	       "  --" OPTION_QP_RECORDS " N: qprobe log capacity in records (default 8M)\n"
 	       "  --" OPTION_CONFIG ": (port,queue,lcore): "
 	       "rx queues configuration\n"
 	       "  --" OPTION_NONUMA ": optional, disable numa awareness\n"
@@ -2462,8 +2325,9 @@ parse_args(int argc, char **argv)
 	                                 {OPTION_RULE_IPV6, 1, 0, 0},
 	                                 {OPTION_ALG, 1, 0, 0},
 	                                 {OPTION_ETH_DEST, 1, 0, 0},
+	                                 {OPTION_QP_LOG, 1, 0, 0},
+	                                 {OPTION_QP_RECORDS, 1, 0, 0},
 	                                 QFLOW_LONG_OPTIONS,
-	                                 ADAPTIVE_LONG_OPTIONS,
 	                                 {NULL, 0, 0, 0}};
 
 	static const char short_options[] = "q:" /* queues  */
@@ -2521,13 +2385,6 @@ parse_args(int argc, char **argv)
 			}
 			if (ret > 0)
 				break;
-			ret = adaptive_parse_long_opt(&adaptive_opts, lgopts[option_index].name, optarg);
-			if (ret < 0) {
-				print_usage(prgname);
-				return -1;
-			}
-			if (ret > 0)
-				break;
 
 			if (!strncmp(lgopts[option_index].name, OPTION_CONFIG, sizeof(OPTION_CONFIG))) {
 				ret = parse_config(optarg);
@@ -2567,6 +2424,17 @@ parse_args(int argc, char **argv)
 				printf("set jumbo frame max packet length "
 				       "to %u\n",
 				       (unsigned int)port_conf.rxmode.max_rx_pkt_len);
+			}
+
+			if (!strncmp(lgopts[option_index].name, OPTION_QP_LOG, sizeof(OPTION_QP_LOG)))
+				qp_log_path = optarg;
+
+			if (!strncmp(lgopts[option_index].name, OPTION_QP_RECORDS, sizeof(OPTION_QP_RECORDS))) {
+				qp_records = strtoull(optarg, NULL, 10);
+				if (qp_records == 0) {
+					printf("invalid %s value:\"%s\"\n", OPTION_QP_RECORDS, optarg);
+					return -1;
+				}
 			}
 
 			if (!strncmp(lgopts[option_index].name, OPTION_RULE_IPV4, sizeof(OPTION_RULE_IPV4)))
@@ -2822,7 +2690,6 @@ main(int argc, char **argv)
 
 	/* parse application arguments (after the EAL ones) */
 	qflow_opts_init(&qflow);
-	adaptive_opts_init(&adaptive_opts);
 	ret = parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid L3FWD parameters\n");
@@ -2830,33 +2697,9 @@ main(int argc, char **argv)
 	nb_lcores = rte_lcore_count();
 	if (qflow_check(&qflow, queues, nb_lcores) < 0)
 		rte_exit(EXIT_FAILURE, "Invalid policy configuration\n");
-	if (nb_lcores != 1 || qflow.mode != QFLOW_SINGLE)
-		rte_exit(EXIT_FAILURE, "adaptive runs on one lcore\n");
-	if (queues > MAX_RX_QUEUE_PER_PORT)
-		rte_exit(EXIT_FAILURE, "at most %u queues\n", MAX_RX_QUEUE_PER_PORT);
-	if (adaptive_check(&adaptive_opts, queues) < 0)
-		rte_exit(EXIT_FAILURE, "Invalid adaptive configuration\n");
 	aggressive = qflow.aggressive;
 	penalty    = qflow.penalty ? qflow.penalty_turns : 0;
 	qflow_print(&qflow, queues);
-	if (adaptive_opts.enabled)
-		printf("Adaptive: %u to %u queues, start %u, epoch %u ms, threshold %u%%, hold %u\n",
-		       adaptive_opts.min,
-		       queues,
-		       adaptive_opts.start,
-		       adaptive_opts.epoch_ms,
-		       adaptive_opts.threshold_pct,
-		       adaptive_opts.hold);
-	if (adaptive_opts.enabled)
-		printf("Adaptive signal mode: double above %g%% of full polls leaving half the ring, halve "
-		       "above %u%% empty polls or below %g%%\n",
-		       adaptive_opts.backlog_high_pct,
-		       adaptive_opts.empty_high_pct,
-		       adaptive_opts.backlog_low_pct);
-	if (adaptive_opts.enabled && adaptive_opts.search)
-		printf("Adaptive search: a flat grow jumps 2, 4, 8 octaves before it is undone, "
-		       "trying fewer queues is judged, no signal for %u epochs probes fewer\n",
-		       ADAPTIVE_PROBE_EPOCHS);
 
 	if (check_lcore_params() < 0)
 		rte_exit(EXIT_FAILURE, "check_lcore_params failed\n");
@@ -2874,23 +2717,50 @@ main(int argc, char **argv)
 	if (app_acl_init() < 0)
 		rte_exit(EXIT_FAILURE, "app_acl_init failed\n");
 
-	if (!nf_init(1, false, false)) {
+	/* NAT shards: one table, or one per lcore (Partitioned) */
+	uint16_t nat_shards = 1;
+	if (qflow.mode == QFLOW_PARTITIONED)
+		nat_shards = nb_lcores;
+	if (!nf_init(nat_shards, qflow.mode != QFLOW_SINGLE)) {
 		printf("Could not initialize NF\n");
 		rte_exit(EXIT_FAILURE, "Error initializing NF");
 	}
 
-	int nb_mbufs = RTE_MAX(
-	    queues * 1 * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
+	if (qflow.mode == QFLOW_PARTITIONED) {
+		/* One mbuf pool per lcore, sized for the queues it owns */
+		uint32_t queues_per_lcore = (queues + nb_lcores - 1) / nb_lcores;
+		RTE_LCORE_FOREACH(lcore_id)
+		{
+			char pool_name[64];
+			snprintf(pool_name, sizeof(pool_name), "mbuf_pool_lcore_%u", lcore_id);
 
-	pktmbuf_pool[0] = rte_pktmbuf_pool_create("mbuf_pool",
-	                                          nb_mbufs,
-	                                          MEMPOOL_CACHE_SIZE,
-	                                          0,
-	                                          RTE_MBUF_DEFAULT_BUF_SIZE,
-	                                          rte_socket_id());
-	if (pktmbuf_pool[0] == NULL)
-		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
-	struct rte_mempool *main_pool = pktmbuf_pool[0];
+			uint32_t lcore_nb_mbufs = RTE_MAX(
+			    queues_per_lcore * (nb_rxd + MAX_PKT_BURST) + nb_txd + MEMPOOL_CACHE_SIZE, 8192U);
+
+			pktmbuf_pool[lcore_id] = rte_pktmbuf_pool_create(pool_name,
+			                                                 lcore_nb_mbufs,
+			                                                 MEMPOOL_CACHE_SIZE,
+			                                                 0,
+			                                                 RTE_MBUF_DEFAULT_BUF_SIZE,
+			                                                 rte_lcore_to_socket_id(lcore_id));
+			if (pktmbuf_pool[lcore_id] == NULL)
+				rte_exit(EXIT_FAILURE, "Cannot init mbuf pool for lcore %u\n", lcore_id);
+		}
+	} else {
+		int nb_mbufs = RTE_MAX(
+		    queues * 1 * (nb_rxd + nb_txd + MAX_PKT_BURST + nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
+
+		pktmbuf_pool[0] = rte_pktmbuf_pool_create("mbuf_pool",
+		                                          nb_mbufs,
+		                                          MEMPOOL_CACHE_SIZE,
+		                                          0,
+		                                          RTE_MBUF_DEFAULT_BUF_SIZE,
+		                                          rte_socket_id());
+		if (pktmbuf_pool[0] == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+	}
+	struct rte_mempool *main_pool =
+	    pktmbuf_pool[qflow.mode == QFLOW_PARTITIONED ? rte_get_main_lcore() : 0];
 
 	for (int i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++) {
 		queue_hit[i] = penalty;
@@ -3062,8 +2932,12 @@ main(int argc, char **argv)
 				         "rte_pmd_qdma_set_queue_mode : "
 				         "Passing of STREAMING_MODE "
 				         "failed\n");
+			struct rte_mempool *pool =
+			    qflow.mode == QFLOW_PARTITIONED
+			        ? pktmbuf_pool[get_lcore_for_queue(x, queues, nb_lcores)]
+			        : pktmbuf_pool[0];
 			ret = rte_eth_rx_queue_setup(
-			    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pktmbuf_pool[0]);
+			    portid, x, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, pool);
 			if (ret < 0)
 				rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
 		}
@@ -3104,6 +2978,13 @@ main(int argc, char **argv)
 	/* Count-Min Sketch, one per lcore */
 	RTE_LCORE_FOREACH(lcore_id)
 	{
+		if (qflow.mode == QFLOW_PARTITIONED) {
+			cm_part_per_core[lcore_id] = rte_zmalloc_socket(
+			    NULL, sizeof(struct countmin_partitioned), 64, rte_lcore_to_socket_id(lcore_id));
+			if (cm_part_per_core[lcore_id] == NULL)
+				rte_exit(EXIT_FAILURE, "Failed to allocate CMS for lcore %u\n", lcore_id);
+			continue;
+		}
 		struct countmin *cm = rte_zmalloc(NULL, sizeof(struct countmin), 64);
 		cm->values          = rte_zmalloc(NULL, sizeof(uint64_t *) * HASHFN_N, 64);
 		for (int i = 0; i < HASHFN_N; i++) {
@@ -3143,41 +3024,34 @@ main(int argc, char **argv)
 		}
 	}
 
-	/* RX port and queues the NIC starts with */
-	rx_port       = lcore_conf[rte_get_main_lcore()].rx_queue_list[0].port_id;
-	rx_ring_size  = qdma_rx_ring_size(rx_port, 0);
-	snap_period   = (uint64_t)adaptive_opts.snapshot_ms * rte_get_timer_hz() / MS_PER_S;
-	snap_next     = rte_rdtsc() + 5 * rte_get_timer_hz(); /* after the startup */
-	active_queues = queues;
-	polled_queues = queues;
-	if (adaptive_opts.enabled) {
-		if (rss_mask_locate(rx_port, queues) < 0)
-			rte_exit(EXIT_FAILURE, "Cannot find the RSS mask register of port %u\n", rx_port);
-		printf("RSS mask register: 0x%x\n", rss_mask_reg);
-		adaptive_ctl_init(&adaptive_ctl, &adaptive_opts, queues);
-		set_active_queues((uint16_t)adaptive_opts.start, rte_rdtsc());
-	}
-
+	/* launch per-lcore init on every lcore */
+	lcore_function_t *main_loop = main_loop_single;
+	if (qflow.mode == QFLOW_PARTITIONED)
+		main_loop = main_loop_partitioned;
+	qp_init(qp_records);
+	qp_start();
 	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
 	RTE_LCORE_FOREACH_WORKER(lcore_id)
 	{
 		if (rte_eal_wait_lcore(lcore_id) < 0)
 			return -1;
 	}
-	print_stats();
-	print_queue_packet_histogram();
-	if (adaptive_opts.enabled)
-		print_adaptive_summary();
+	if (qflow.mode == QFLOW_SINGLE) {
+		print_stats();
+		print_queue_packet_histogram();
 
-	printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
-	printf("measured RX Throughput: %.2f\n",
-	       (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
-	printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
+		printf("measured RX packets: %.2f\n", (float)measured_packets_rx);
+		printf("measured RX Throughput: %.2f\n",
+		       (double)measured_packets_rx / ((double)end_time / (double)rte_get_timer_hz()));
+		printf("measured time: %.2f seconds\n", (double)end_time / (double)rte_get_timer_hz());
+	}
+	qp_finish(qp_log_path, queues);
 
 	RTE_LCORE_FOREACH(lcore_id)
 	{
 		struct countmin *cm = cm_per_core[lcore_id];
 
+		rte_free(cm_part_per_core[lcore_id]);
 		if (cm == NULL)
 			continue;
 		for (int i = 0; i < HASHFN_N; i++) {

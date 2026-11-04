@@ -7,11 +7,11 @@
 #include "qflow.h"
 #include "qbitstream.h"
 #ifdef MICA_ADAPTIVE
-#include "adaptive.h" /* ../adaptive/src: adaptive queue count */
+#include "adaptive.h" /* common/: adaptive queue count */
 #include "qdma_rss.h"
 #endif
 #ifdef MICA_QPROBE
-#include "qprobe.h" /* starvation/src: poll timestamps and marked packets */
+#include "qprobe.h" /* common/: poll timestamps and marked packets */
 #endif
 #include <arpa/inet.h>
 #include <locale.h>
@@ -51,7 +51,6 @@
 #include <rte_ip.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
-#include <rte_spinlock.h>
 #include <rte_string_fns.h>
 
 #include <unistd.h>
@@ -95,23 +94,8 @@ uint64_t measured_tick = 0;
 #define MAX_RX_QUEUE_PER_LCORE 2048
 #define MAX_RX_QUEUE_PER_PORT 2048
 
-/* Shared: an lcore polls a queue only while holding its lock. Packed, 16 locks
- * share a cache line that every trylock writes; the MICA_PADDED_QUEUE_LOCKS
- * variant (mica/Makefile) gives each lock its own pair of lines (the spatial
- * prefetcher fetches lines in pairs) */
-#ifdef MICA_PADDED_QUEUE_LOCKS
-struct rx_queue_lock {
-	rte_spinlock_t lock;
-} __rte_aligned(128);
-static struct rx_queue_lock rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
-#define RX_QUEUE_LOCK(pid, qid) (&rx_queue_locks[pid][qid].lock)
-#else
-static rte_spinlock_t rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
-#define RX_QUEUE_LOCK(pid, qid) (&rx_queue_locks[pid][qid])
-#endif
-
 #ifdef MICA_QPROBE
-/* qprobe log (see starvation/src/qprobe.h) */
+/* qprobe log (see common/qprobe.h) */
 static const char *qp_log_path = NULL;
 static uint64_t    qp_records  = 8u << 20;
 #define QP_LONG_OPTIONS {"log", 1, 0, 0}, {"log-records", 1, 0, 0},
@@ -127,15 +111,6 @@ static uint64_t    qp_records  = 8u << 20;
 #define AD_USAGE ""
 #endif
 
-#ifdef MICA_SHARED_AFFINITY
-/* Shared with affinity: whether an lcore found a full burst on its own queues
- * in its last sweep, indexed by lcore index */
-struct lcore_backlog_state {
-	volatile bool backlogged;
-} __rte_aligned(128);
-static struct lcore_backlog_state lcore_backlog[RTE_MAX_LCORE];
-#endif
-
 /* Per-port statistics struct */
 struct port_statistics {
 	uint64_t tx;
@@ -149,18 +124,10 @@ int                     queue_hit[MAX_RX_QUEUE_PER_LCORE] = {1};
 struct mehcached_table  table_o;
 struct mehcached_table *table;
 
-static void
-init_rx_queue_locks(void)
-{
-	for (uint16_t pid = 0; pid < RTE_MAX_ETHPORTS; pid++)
-		for (uint16_t qid = 0; qid < MAX_RX_QUEUE_PER_PORT; qid++)
-			rte_spinlock_init(RX_QUEUE_LOCK(pid, qid));
-}
-
 #ifdef MICA_ADAPTIVE
-/* Adaptive queue count on a single core (../adaptive/src/adaptive.h): the
+/* Adaptive queue count on a single core (common/adaptive.h): the
  * mask register, the loop, the controller and the per-second statistics
- * follow the adaptive app (adaptive/src/main.c), with MICA's work per burst */
+ * follow the adaptive app (experiments/apps/adaptive/src/main.c), with MICA's work per burst */
 void                        qdma_reg_write_usr(void *dev_hndl, uint32_t reg_offst, uint32_t val);
 static struct adaptive_opts adaptive_opts;
 static struct adaptive_ctl  adaptive_ctl;
@@ -321,19 +288,17 @@ _Static_assert(sizeof(struct five_tuple) % 8 == 0, "MICA reads keys in 8-byte wo
 static int VALUE_SIZE = 1400;
 size_t     default_keys[NUM_KEYS];
 
-/* Bytes of the value copied into the packet. The frame stays 64 bytes, so the
- * default copies 1400 bytes into the RX buffer that are never sent; the
- * MICA_NO_VALUE_COPY variant (mica/Makefile) copies only what the frame holds.
- * MICA_KEEP_PAYLOAD (the -lat and -qprobe variants) copies nothing: the TRex
- * latency trailer in the last 16 bytes of the frame must come back intact */
+/* Bytes of the value copied into the packet: only what the 64-byte frame
+ * holds (copying the 1400-byte value into the RX buffer made the rings outgrow
+ * the LLC at ~16 queues). MICA_KEEP_PAYLOAD (the -lat, -qprobe and -adaptive
+ * builds) copies nothing: the TRex latency trailer in the last 16 bytes of the
+ * frame must come back intact */
 #if defined(MICA_KEEP_PAYLOAD)
 #define VALUE_COPY_SIZE 0
-#elif defined(MICA_NO_VALUE_COPY)
+#else
 #define VALUE_COPY_SIZE                                                                            \
 	(64 - (int)(sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +                      \
 	            sizeof(struct rte_udp_hdr) + sizeof(size_t)))
-#else
-#define VALUE_COPY_SIZE VALUE_SIZE
 #endif
 
 /* GET and SET alternate: one toggle on a single core, one per lcore otherwise.
@@ -429,18 +394,8 @@ mica_request(uint8_t *pkt, const struct five_tuple *key_p, uint64_t key_hash, co
 	return 0;
 }
 
-static __rte_always_inline int
-mica_process5tuple(uint8_t *pkt, const enum qflow_mode mode)
-{
-	struct five_tuple key;
-	const uint64_t    key_hash = mica_key(pkt, &key);
-
-	return mica_request(pkt, &key, key_hash, mode);
-}
-
-#ifdef MICA_BATCH_PREFETCH
 /*
- * MICA's request pipeline, which the port did not use: hash every key of the
+ * MICA's request pipeline, which the original port did not use: hash every key of the
  * burst and prefetch its bucket, then the item the bucket points to, then run
  * the requests, so the L3 latency of one request overlaps with the others.
  * mehcached_prefetch_alloc() fetches the first 2 lines of the item (prefetching
@@ -463,28 +418,11 @@ mica_process_burst_prefetch(struct rte_mbuf **pkts_burst, int nb_pkts, const enu
 		mica_request(rte_pktmbuf_mtod(pkts_burst[i], uint8_t *), &keys[i], hashes[i], mode);
 	return 0;
 }
-#endif
 
 static __rte_always_inline int
 mica_process_burst(struct rte_mbuf **pkts_burst, int nb_pkts, const enum qflow_mode mode)
 {
-#ifdef MICA_BATCH_PREFETCH
 	return mica_process_burst_prefetch(pkts_burst, nb_pkts, mode);
-#endif
-#ifdef MICA_FORWARD_ONLY
-	/* the polling loop alone: what the NIC and the PMD forward without MICA */
-	RTE_SET_USED(pkts_burst);
-	RTE_SET_USED(nb_pkts);
-	RTE_SET_USED(mode);
-	return 0;
-#endif
-	for (int i = 0; i < nb_pkts; i++) {
-
-		uint8_t *payload;
-		payload = rte_pktmbuf_mtod(pkts_burst[i], uint8_t *);
-		mica_process5tuple(payload, mode);
-	}
-	return 0;
 }
 
 /* main processing loop */
@@ -496,10 +434,8 @@ uint64_t end_time = 0;
  *  - single core: polls every queue, prints statistics every second, sends
  *    each burst on TX queue 0 and measures throughput after a 3 s warmup;
  *  - Partitioned: polls a contiguous slice of queues, batches TX on its own
- *    TX queue;
- *  - Shared: polls every queue under a per-queue trylock, batches TX on its
- *    own TX queue.
- * Penalty, Aggressive and Latency apply on top of all three.
+ *    TX queue.
+ * Penalty, Aggressive and Latency apply on top of both.
  */
 static __rte_always_inline int
 poll_loop(const enum qflow_mode mode)
@@ -545,30 +481,6 @@ poll_loop(const enum qflow_mode mode)
 	const bool     has_latency_queue =
         (latency_queue >= first_queue) && (latency_queue < last_queue);
 
-#ifdef MICA_SHARED_AFFINITY
-	/* Shared with affinity: every lcore owns the slice Partitioned would give
-	 * it and polls another lcore's queue only while it has spare capacity
-	 * (no full burst on its own queues in the last sweep) and the owner is
-	 * backlogged, so a flow stays on one lcore unless the load is uneven */
-	uint8_t  queue_owner[MAX_RX_QUEUE_PER_PORT];
-	uint16_t home_first = 0, home_last = 0;
-	bool     home_full = false, steal = false;
-	if (mode == QFLOW_SHARED) {
-		const uint16_t queues_per_lcore = queues / active_io_lcores;
-		const uint16_t extra_queues     = queues % active_io_lcores;
-		for (unsigned l = 0; l < active_io_lcores; l++) {
-			const uint16_t first = (uint16_t)(l * queues_per_lcore + RTE_MIN(l, extra_queues));
-			const uint16_t n     = (uint16_t)(queues_per_lcore + (l < extra_queues));
-			for (uint16_t q = first; q < first + n; q++)
-				queue_owner[q] = (uint8_t)l;
-			if (l == lcore_idx) {
-				home_first = first;
-				home_last  = first + n;
-			}
-		}
-	}
-#endif
-
 	if (assigned_queues == 0) {
 		printf("entering main loop on lcore %u (idle, no RX queues assigned)\n", lcore_id);
 		return 0;
@@ -584,17 +496,6 @@ poll_loop(const enum qflow_mode mode)
 	if (mode != QFLOW_SINGLE)
 		for (int qi = 0; qi < assigned_queues; qi++)
 			queue_hit_local[qi] = penalty;
-
-#ifdef MICA_MARCO_PROBE
-	/* mica-marco/Makefile builds this file on Marco's PMD (dpdk20.11-marco),
-	 * whose probe fails on a port that is not a configured QDMA port or on a
-	 * range beyond its queues: check once instead of every sweep */
-	uint16_t ready[MAX_RX_QUEUE_PER_LCORE]; /* filled by the probe, unused */
-	if (rte_pmd_qdma_rx_queue_probe_many(portid, first_queue, assigned_queues, ready) < 0) {
-		printf("rte_pmd_qdma_rx_queue_probe_many failed on lcore %u\n", lcore_id);
-		return -1;
-	}
-#endif
 
 	if (mode == QFLOW_SINGLE)
 		printf("entering main loop on lcore %u\n", lcore_id);
@@ -638,24 +539,10 @@ poll_loop(const enum qflow_mode mode)
 		int max_loops = QFLOW_MAX_CONSECUTIVE_POLLS;
 		int tx_total  = 0;
 
-#ifdef MICA_MARCO_PROBE
-		/* Prefetch only (as mica-marco-pf): the probe reads the write-back
-		 * pidx of every queue of the sweep through the PMD's poll_hot mirror,
-		 * so the rx_burst calls below find it in cache; every queue is still
-		 * polled */
-		rte_pmd_qdma_rx_queue_probe_many(portid, first_queue, assigned_queues, ready);
-#endif
-
 		for (i = first_queue; i < last_queue; ++i) {
 			/* Partitioned indexes its counters relative to its slice and
 			 * keeps that index across a latency diversion */
 			const int qi = i - first_queue;
-
-#ifdef MICA_SHARED_AFFINITY
-			if (mode == QFLOW_SHARED && (i < home_first || i >= home_last) &&
-			    !(steal && lcore_backlog[queue_owner[i]].backlogged))
-				continue;
-#endif
 
 			if ((penalty > 0) && (hit[qi] < penalty)) {
 				hit[qi]++;
@@ -670,18 +557,7 @@ poll_loop(const enum qflow_mode mode)
 				inject_queue = false;
 			}
 
-			if (mode == QFLOW_SHARED) {
-				nb_rx = 0;
-				if (!rte_spinlock_trylock(RX_QUEUE_LOCK(portid, i)))
-					continue;
-			}
 			nb_rx = rte_eth_rx_burst(portid, i, pkts_burst, MAX_PKT_BURST);
-			if (mode == QFLOW_SHARED)
-				rte_spinlock_unlock(RX_QUEUE_LOCK(portid, i));
-#ifdef MICA_SHARED_AFFINITY
-			if (mode == QFLOW_SHARED && nb_rx == MAX_PKT_BURST && i >= home_first && i < home_last)
-				home_full = true;
-#endif
 #ifdef MICA_QPROBE
 			qp_poll(lcore_id, (uint16_t)i, pkts_burst, (uint16_t)nb_rx, MAX_PKT_BURST);
 #endif
@@ -771,16 +647,6 @@ poll_loop(const enum qflow_mode mode)
 				rte_pktmbuf_free(tx_batch[j]);
 		}
 
-#ifdef MICA_SHARED_AFFINITY
-		if (mode == QFLOW_SHARED) {
-			/* written only when it changes, so the readers keep their copy */
-			if (lcore_backlog[lcore_idx].backlogged != home_full)
-				lcore_backlog[lcore_idx].backlogged = home_full;
-			steal     = !home_full;
-			home_full = false;
-		}
-#endif
-
 		if (mode == QFLOW_SINGLE) {
 			if ((cur_tsc - start_time) > stop_time) {
 				end_time = cur_tsc - end_warmup;
@@ -819,7 +685,7 @@ rss_reta_first(uint16_t pid)
 }
 
 /* The mask register is 16 bits wide and its first read after startup can
- * return garbage: read twice and keep the low half (adaptive/src/main.c) */
+ * return garbage: read twice and keep the low half (experiments/apps/adaptive/src/main.c) */
 static uint32_t
 rss_mask_read(struct rte_eth_dev *dev, uint32_t reg)
 {
@@ -1136,12 +1002,6 @@ static int
 main_loop_partitioned(__rte_unused void *dummy)
 {
 	return poll_loop(QFLOW_PARTITIONED);
-}
-
-static int
-main_loop_shared(__rte_unused void *dummy)
-{
-	return poll_loop(QFLOW_SHARED);
 }
 
 static unsigned int
@@ -1488,7 +1348,6 @@ main(int argc, char **argv)
 	for (int i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++) {
 		queue_hit[i] = penalty;
 	}
-	init_rx_queue_locks();
 
 	/* Configure port */
 	struct rte_eth_conf port_conf = {0};
@@ -1634,14 +1493,14 @@ main(int argc, char **argv)
 		numa_nodes[i] = (size_t)-1;
 	/*
 	 * Single core: non-concurrent table. ported-mica/table.h swaps the two
-	 * thresholds (upstream MICA has FIFO 1.0, LRU 0.0), so the FIFO name gives
-	 * full LRU: every GET moves its item to the head of the log. The
-	 * MICA_TRUE_FIFO variant (mica/Makefile) passes 1.0. Multicore: concurrent
+	 * thresholds (upstream MICA has FIFO 1.0, LRU 0.0), so the FIFO name would
+	 * give full LRU (every GET moves its item to the head of the log): the
+	 * threshold passed is 1.0, i.e. true FIFO. Multicore: concurrent
 	 * table when more than one lcore polls, and no move-to-head on GET.
 	 * Every SET locks the log pool it appends to and holds the lock while it
 	 * writes the value; with one pool that lock, and the pool's head/tail on
 	 * the same cache line that every GET reads, serialize the lcores. The
-	 * MICA_POOL_PER_LCORE variant gives every polling lcore its own pool.
+	 * MICA_POOL_PER_LCORE build gives every polling lcore its own pool.
 	 */
 	const bool concurrent_mica = active_io_lcores > 1;
 #ifdef MICA_POOL_PER_LCORE
@@ -1650,12 +1509,7 @@ main(int argc, char **argv)
 #else
 	const size_t num_pools = 1;
 #endif
-#ifdef MICA_TRUE_FIFO
 	const double mth_threshold = 1.0;
-#else
-	const double mth_threshold =
-	    qflow.mode == QFLOW_SINGLE ? MEHCACHED_MTH_THRESHOLD_FIFO : 1.0;
-#endif
 	mehcached_table_init(table,
 	                     (NUM_KEYS + MEHCACHED_ITEMS_PER_BUCKET - 1) / MEHCACHED_ITEMS_PER_BUCKET,
 	                     num_pools,
@@ -1707,8 +1561,6 @@ main(int argc, char **argv)
 	lcore_function_t *main_loop = main_loop_single;
 	if (qflow.mode == QFLOW_PARTITIONED)
 		main_loop = main_loop_partitioned;
-	else if (qflow.mode == QFLOW_SHARED)
-		main_loop = main_loop_shared;
 #ifdef MICA_QPROBE
 	qp_init(qp_records);
 	qp_start();

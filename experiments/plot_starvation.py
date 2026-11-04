@@ -3,7 +3,7 @@ Plots for the starvation / FCT campaign of starvation.py.
 
   python3 plot_starvation.py                          # results/starvation/
   python3 plot_starvation.py results/starvation --skew 0.6 --rate 2
-  python3 plot_starvation.py results/starvation/ndr --ndr  # starvation.py --ndr
+  python3 plot_starvation.py results/starvation/ndr --ndr  # runs of the removed starvation.py --ndr
 
 Writes PDF and PNG into plots/starvation/ (--out):
   service_gap_<metric>    max / p99.9 service gap vs queues, one panel per skew x rate
@@ -358,7 +358,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("results", nargs="?", default=os.path.join(HERE, "results", "starvation"))
     parser.add_argument("--out", help="default plots/starvation, plots/starvation/ndr with --ndr")
-    parser.add_argument("--ndr", action="store_true", help="results of starvation.py --ndr")
+    parser.add_argument("--ndr", action="store_true", help="results of the removed starvation.py --ndr")
     parser.add_argument("--skew", type=float, default=0.6, help="skew of the per-queue / FCT / rank plots")
     parser.add_argument("--rate", type=float, default=2.0, help="rate of the per-queue / CCDF / rank plots")
     args = parser.parse_args()

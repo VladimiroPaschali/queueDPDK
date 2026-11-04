@@ -36,10 +36,9 @@ struct nf_config;
 // int nf_process(uint16_t device, uint8_t *buffer, uint16_t packet_length,vigor_time_t now);
 // #endif
 
-/* Allocate nb_shards NAT flow tables. shared selects the Shared variant
- * (locked tables, 15-byte FlowIds); drop_full drops packets of new flows
+/* Allocate nb_shards NAT flow tables. drop_full drops packets of new flows
  * when a shard is full instead of forwarding them untranslated. */
-bool nf_init(uint16_t nb_shards, bool shared, bool drop_full);
+bool nf_init(uint16_t nb_shards, bool drop_full);
 extern uint64_t nf_flows_allocated, nf_flows_failed, nf_already_translated;
 struct FlowManager *nf_shard(uint16_t shard);
 extern struct nf_config config;

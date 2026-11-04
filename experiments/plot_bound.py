@@ -6,6 +6,14 @@ plots/ndr/).
   python3 plot_bound.py                 # nf-chain and mica
   python3 plot_bound.py --apps mica
   python3 plot_bound.py --apps mica-fifo-nocopy --bound seq-trex2   # another bound experiment
+  python3 plot_bound.py --tag pfch64 --apps nf-chain   # policies of nf-chain-pfch64, into plots/bound/pfch64/
+  python3 plot_bound.py --tag pfch64 --lines-tagged --apps nf-chain   # lines from the same tagged runs
+
+With --tag <t> the policies come from experiment <app>-<t> (the results of
+run_ndr.sh) and the two horizontal lines stay those of the untagged runs:
+<app>-<bound> and round robin on 1 queue of <app>. With --lines-tagged they
+come from the same tag too: <app>-<bound>-<t> (run_ndr.sh runs the bounds with
+the tag) and round robin of <app>-<t>.
 
 The bound is experiment <app>-seq-ring8192: the same Zipf flows sent one after
 the other (sequential-profile.py) on 1 queue, so every burst holds one flow,
@@ -45,6 +53,8 @@ GENERATOR_LIMITED_ITERATIONS = 3
 
 
 BOUND = "seq-ring8192"  # --bound: experiment <app>-<BOUND> drawn as "theoretical max"
+TAG = ""  # --tag: policies from experiment <app>-<TAG>, lines from the untagged runs
+LINES_TAG = ""  # --lines-tagged: "-<TAG>", the suffix of the experiments of the two lines
 
 
 def bound_levels(data, app, skew, metric):
@@ -53,9 +63,9 @@ def bound_levels(data, app, skew, metric):
     for label, key, style in BOUND_LINES:
         key = BOUND if key == "seq-ring8192" else key
         if key != "rr1":
-            rows = data.get(f"{app}-{key}", {}).get(skew, {}).get(("baseline", 1), [])
+            rows = data.get(f"{app}-{key}{LINES_TAG}", {}).get(skew, {}).get(("baseline", 1), [])
         else:
-            rows = data.get(app, {}).get(skew, {}).get(("baseline", 1), [])
+            rows = data.get(f"{app}{LINES_TAG}", {}).get(skew, {}).get(("baseline", 1), [])
         s = pn.stat(rows, metric) if rows else None
         if s:
             if key != "rr1" and all(int(r["iterations"]) <= GENERATOR_LIMITED_ITERATIONS for r in rows):
@@ -83,10 +93,11 @@ def bound_legend(fig, lines, y):
 
 def plot_bound(data, app, out_dir):
     """Policies against the bound of a perfect policy (see the module docstring)."""
-    seq = {**data.get(f"{app}-seq", {}), **data.get(f"{app}-{BOUND}", {})}
+    seq = {**data.get(f"{app}-seq{LINES_TAG}", {}), **data.get(f"{app}-{BOUND}{LINES_TAG}", {})}
     if not seq:
         return
-    lines = [("round robin" if l == "baseline" else l, st, src) for l, st, src in pn.single_lines(data, app)]
+    name = f"{app}-{TAG}" if TAG else app
+    lines = [("round robin" if l == "baseline" else l, st, src) for l, st, src in pn.single_lines(data, name)]
     skews = [s for s in pn.SKEWS if s in seq or any(s in src for _, _, src in lines)]
     for metric in list(pn.METRICS) + ["overview"]:
         metrics = list(pn.METRICS) if metric == "overview" else [metric]
@@ -114,32 +125,41 @@ def plot_bound(data, app, out_dir):
         if len(metrics) == 1:
             fig.tight_layout(rect=(0, 0, 1, 0.84))
             bound_legend(fig, lines, 0.97)
-            fig.suptitle(f"{app}, 1 core: policies against the bound of a perfect policy", y=1.02, fontsize=9,
+            fig.suptitle(f"{name}, 1 core: policies against the bound of a perfect policy", y=1.02, fontsize=9,
                          color=pn.INK)
         else:
             bound_legend(fig, lines, 1.0)
-            fig.suptitle(f"{app}, 1 core: policies against the bound of a perfect policy", y=1.015, fontsize=9,
+            fig.suptitle(f"{name}, 1 core: policies against the bound of a perfect policy", y=1.015, fontsize=9,
                          color=pn.INK)
             fig.tight_layout(rect=(0, 0, 1, 0.985))
-        pn.save(fig, out_dir, f"{app}_bound_{metric}")
+        pn.save(fig, out_dir, f"{name}_bound_{metric}")
 
 
 def main():
-    global BOUND
+    global BOUND, TAG, LINES_TAG
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", default=os.path.join(HERE, "results", "ndr"),
                         help="directory holding the results_* folders")
-    parser.add_argument("--out", default=os.path.join(HERE, "plots", "bound"))
+    parser.add_argument("--out", help="output directory (default plots/bound, plots/bound/<tag> with --tag)")
     parser.add_argument("--apps", nargs="+", default=["nf-chain", "mica"])
     parser.add_argument("--bound", default=BOUND,
                         help="suffix of the experiment drawn as theoretical max (default %(default)s)")
+    parser.add_argument("--tag", default="",
+                        help="draw the policies of experiment <app>-<tag> (e.g. pfch64) against the untagged lines")
+    parser.add_argument("--lines-tagged", action="store_true",
+                        help="with --tag, take the bound and round robin lines from the tagged runs too")
     args = parser.parse_args()
-    BOUND = args.bound
+    BOUND, TAG = args.bound, args.tag
+    LINES_TAG = f"-{TAG}" if TAG and args.lines_tagged else ""
+    args.out = args.out or os.path.join(HERE, "plots", "bound", *([TAG] if TAG else []))
     data = pn.load(args.results)
     os.makedirs(args.out, exist_ok=True)
     for app in args.apps:
-        if f"{app}-seq" not in data and f"{app}-{BOUND}" not in data:
-            print(f"{app}: no results_{app}-seq{{,-{BOUND}}}_skew* yet")
+        if f"{app}-seq{LINES_TAG}" not in data and f"{app}-{BOUND}{LINES_TAG}" not in data:
+            print(f"{app}: no results_{app}-seq{{,-{BOUND}}}{LINES_TAG}_skew* yet")
+            continue
+        if TAG and f"{app}-{TAG}" not in data:
+            print(f"{app}: no results_{app}-{TAG}_skew* yet")
             continue
         plot_bound(data, app, args.out)
     print(f"Plots in {args.out}/")

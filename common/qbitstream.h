@@ -12,13 +12,15 @@
  *
  * | bitstream                          | 0xBE0 | 0xBE4 |
  * |------------------------------------|-------|-------|
- * | extended_table.bit (repo root)     | 16    | 16    |
- * | onic_au55n_pfch64.bit              | 64    | 16    |
+ * | extended_table.bit (original)      | 16    | 16    |
+ * | extended_table_prefetch.bit (repo  | 64    | 16    |
+ * |   root, built as onic_au55n_pfch64)|       |       |
  * | onic_au55n_coal32.bit              | 16    | 32    |
  * | onic_au55n_pfch64-coal32.bit       | 64    | 32    |
  *
- * The variants are built in ~/dpdk_patched/bitstream (README.md there);
- * qceil/tetto-code.md explains why the prefetch cache matters.
+ * The variants are built in ~/dpdk_patched/bitstream (README.md there). With 16
+ * entries the NIC receive ceiling falls as the active queues share the prefetch
+ * cache (one PCIe descriptor read per packet): the bitstream of the paper has 64.
  */
 #ifndef QBITSTREAM_H
 #define QBITSTREAM_H

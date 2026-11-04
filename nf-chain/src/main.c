@@ -49,7 +49,6 @@
 #include <rte_udp.h>
 #include <rte_string_fns.h>
 #include <rte_acl.h>
-#include <rte_spinlock.h>
 
 #include <cmdline_parse.h>
 #include <cmdline_parse_etheraddr.h>
@@ -68,7 +67,7 @@
 #define HASHFN_N 16
 
 /*
- * Count-Min Sketch. Single core and Shared use 16 rows of 1M counters reached
+ * Count-Min Sketch. Single core uses 16 rows of 1M counters reached
  * through a row-pointer table; Partitioned uses 16 rows of 64K counters
  * embedded in one block. Each lcore owns its sketch.
  */
@@ -150,9 +149,6 @@ struct lcore_rx_queue {
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_ETHPORTS
 #define MAX_RX_QUEUE_PER_PORT 2048
 
-/* Shared: an lcore polls a queue only while holding its lock */
-static rte_spinlock_t rx_queue_locks[RTE_MAX_ETHPORTS][MAX_RX_QUEUE_PER_PORT];
-
 /* Per-port statistics struct */
 struct port_statistics {
 	uint64_t tx;
@@ -204,7 +200,7 @@ static struct rte_eth_conf port_conf = {
         },
 };
 
-/* Single core and Shared use pool 0; Partitioned has one pool per lcore */
+/* Single core uses pool 0; Partitioned has one pool per lcore */
 struct rte_mempool *pktmbuf_pool[RTE_MAX_LCORE] = {NULL};
 
 /* ethernet addresses of ports */
@@ -1765,24 +1761,14 @@ nf_process_burst(struct rte_mbuf   **pkts_burst,
 	return 0;
 }
 
-static void
-init_rx_queue_locks(void)
-{
-	for (uint16_t pid = 0; pid < RTE_MAX_ETHPORTS; pid++)
-		for (uint16_t qid = 0; qid < MAX_RX_QUEUE_PER_PORT; qid++)
-			rte_spinlock_init(&rx_queue_locks[pid][qid]);
-}
-
 /*
  * Polling loop. mode is a constant in each main_loop_* wrapper, so the
  * compiler emits one specialised loop per multicore policy:
  *  - single core: polls every queue, prints statistics every second, sends
  *    each burst on TX queue 0 and measures throughput after a 3 s warmup;
  *  - Partitioned: polls a contiguous slice of queues, batches TX on its own
- *    TX queue;
- *  - Shared: polls every queue under a per-queue trylock, batches TX on its
- *    own TX queue.
- * Penalty, Aggressive and Latency apply on top of all three.
+ *    TX queue.
+ * Penalty, Aggressive and Latency apply on top of both.
  */
 static __rte_always_inline int
 poll_loop(const enum qflow_mode mode)
@@ -1913,14 +1899,7 @@ poll_loop(const enum qflow_mode mode)
 			else
 				portid = rx_portid;
 
-			if (mode == QFLOW_SHARED) {
-				nb_rx = 0;
-				if (!rte_spinlock_trylock(&rx_queue_locks[portid][i]))
-					continue;
-			}
 			nb_rx = rte_eth_rx_burst(portid, (uint16_t)i, pkts_burst, MAX_PKT_BURST);
-			if (mode == QFLOW_SHARED)
-				rte_spinlock_unlock(&rx_queue_locks[portid][i]);
 			if (mode == QFLOW_SINGLE) {
 				n_bursts++;
 				n_pkts += nb_rx;
@@ -1935,7 +1914,7 @@ poll_loop(const enum qflow_mode mode)
 				                       nb_rx,
 				                       portid,
 				                       mode,
-				                       mode == QFLOW_SHARED ? nf_shard((uint16_t)i) : flow_manager,
+				                       flow_manager,
 				                       cms);
 				if (ret == 1) {
 					printf("stopping\n");
@@ -2057,12 +2036,6 @@ static int
 main_loop_partitioned(__rte_unused void *dummy)
 {
 	return poll_loop(QFLOW_PARTITIONED);
-}
-
-static int
-main_loop_shared(__rte_unused void *dummy)
-{
-	return poll_loop(QFLOW_SHARED);
 }
 
 /* Partitioned: lcore that polls a given RX queue */
@@ -2721,13 +2694,11 @@ main(int argc, char **argv)
 	if (app_acl_init() < 0)
 		rte_exit(EXIT_FAILURE, "app_acl_init failed\n");
 
-	/* NAT shards: one table, one per lcore (Partitioned) or one per queue (Shared) */
+	/* NAT shards: one table, or one per lcore (Partitioned) */
 	uint16_t nat_shards = 1;
 	if (qflow.mode == QFLOW_PARTITIONED)
 		nat_shards = nb_lcores;
-	else if (qflow.mode == QFLOW_SHARED)
-		nat_shards = queues;
-	if (!nf_init(nat_shards, qflow.mode == QFLOW_SHARED, qflow.mode != QFLOW_SINGLE)) {
+	if (!nf_init(nat_shards, qflow.mode != QFLOW_SINGLE)) {
 		printf("Could not initialize NF\n");
 		rte_exit(EXIT_FAILURE, "Error initializing NF");
 	}
@@ -2771,7 +2742,6 @@ main(int argc, char **argv)
 	for (int i = 0; i < MAX_RX_QUEUE_PER_LCORE; i++) {
 		queue_hit[i] = penalty;
 	}
-	init_rx_queue_locks();
 
 	/* initialize all ports */
 	RTE_ETH_FOREACH_DEV(portid)
@@ -3036,8 +3006,6 @@ main(int argc, char **argv)
 	lcore_function_t *main_loop = main_loop_single;
 	if (qflow.mode == QFLOW_PARTITIONED)
 		main_loop = main_loop_partitioned;
-	else if (qflow.mode == QFLOW_SHARED)
-		main_loop = main_loop_shared;
 	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MAIN);
 	RTE_LCORE_FOREACH_WORKER(lcore_id)
 	{

@@ -1,5 +1,5 @@
 """
-Reaction of the adaptive app (adaptive/build/adaptive) to changing traffic.
+Reaction of the adaptive app (apps/adaptive/build/adaptive) to changing traffic.
 
 A scenario is a sequence of phases; each phase sets the offered rate, the Zipf
 skew, the number of flows and the packet size of the Zipf load of
@@ -48,7 +48,7 @@ Results in <output>/:
 Plots: plot_adaptive.py.
 
 Examples:
-  python3 adaptive.py --scenarios load --static 128 --phase-duration 10
+  python3 adaptive.py --scenarios ramp --static 128 --phase-duration 10
   python3 adaptive.py --variants "" "--adaptive-epoch 50" "--adaptive-threshold 1"
   python3 adaptive.py                         # every scenario, default comparison
 """
@@ -102,8 +102,8 @@ PORTS = [0]
 PROFILE_FILE = os.path.join(HERE, "zipf-profile.py")
 APP = (ndz.NF_CHAIN.format(lcores="0")
        .replace("(0,0,0),(0,1,1)", "(0,0,0)")
-       .replace("/nf-chain/build/nf-chain", "/adaptive/build/adaptive"))
-APP_PATTERN = "adaptive/build/adaptive"
+       .replace("/nf-chain/build/nf-chain", "/experiments/apps/adaptive/build/adaptive"))
+APP_PATTERN = "experiments/apps/adaptive/build/adaptive"
 # --app mica: the single-core MICA of latency.py built with the controller
 # (mica/Makefile, -fifo-nocopy-prefetch-adaptive), same output lines
 APPS = {
@@ -122,10 +122,6 @@ PROBE_SRC, PROBE_DST, PROBE_SPORT, PROBE_DPORT = "100.66.0.1", "100.67.0.1", 200
 PROBE_MACS = dict(src="e8:eb:d3:78:95:8d", dst="58:a2:e1:d0:69:ce")
 PROBE_PG_BASE = 100
 
-# Offered rate above the single-core capacity of nf-chain (~3-5 Mpps): the
-# returned rate is then the app's throughput.
-SAT = 8.0
-
 
 def phase(rate, skew=0.6, flows=10000, size=64):
     """rate in Mpps (0 stops the traffic)."""
@@ -133,37 +129,15 @@ def phase(rate, skew=0.6, flows=10000, size=64):
 
 
 SCENARIOS = {
-    # flows changing at a rate every policy sustains with the right queue count
-    # (zero-loss: aggressive 3.2-4.3 Mpps, baseline and penalty 2.6-4.2 Mpps
-    # from 15000 to 100 flows)
-    "flows-rate": [phase(2.5, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
-    # the same flows at 3 Mpps, where 1 queue is overloaded from 5000 flows on
-    "flows-rate3": [phase(3.0, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
-    # and at 3.5 Mpps: from 10000 flows on above the zero-loss rate of every
-    # fixed queue count (at most ~3.5 Mpps, Aggressive on 128 queues; ~2.7
-    # Baseline and Penalty), and of 1 queue already from 5000 flows (~3.0)
+    # NF chain, flows changing at 3.5 Mpps: from 10000 flows on above the
+    # zero-loss rate of every fixed queue count (at most ~3.5 Mpps, Aggressive
+    # on 128 queues), and of 1 queue already from 5000 flows (~3.0)
     "flows-rate35": [phase(3.5, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
-    # load staircase up and down: idle-ish, below and above capacity
-    "load": [phase(r) for r in (0.5, 1, 2, 3, 4, SAT, 4, 2, 1, 0.5)],
-    # finer steps around the single-core capacity (~2.4-3.4 Mpps), up and down
+    # load staircase up and down, with finer steps around the single-core
+    # capacity (~2.4-3.4 Mpps)
     "ramp": [phase(r) for r in (0.5, 1, 1.5, 2, 2.5, 3, 3.25, 3.5, 3.25, 3, 2.5, 2, 1, 0.5)],
-    # same overload, more and less skewed traffic
-    "skew": [phase(SAT, skew=s) for s in (0.1, 0.6, 0.9, 0.6, 0.1)],
-    # same overload, more and fewer active flows (the NAT table holds 16384:
-    # above that every packet takes the slow path and nf-chain drops to ~1 Mpps)
-    "flows": [phase(SAT, flows=f) for f in (100, 1000, 10000, 15000, 1000)],
-    # traffic that stops and restarts, with a light phase in between
-    "onoff": [phase(r) for r in (SAT, 0, SAT, 0, 0.5, SAT)],
-    # a skewed load at moderate rate
-    "skew-load": [phase(r, skew=s) for s, r in ((0.9, 1), (0.9, 3), (0.1, 3), (0.1, 1), (0.6, SAT))],
-    # larger packets: fewer pps for the same bandwidth, more bytes per packet
-    "size": [phase(SAT, size=s) for s in (64, 256, 1024, 64)],
-    # everything changes at once
-    "mixed": [phase(1, 0.9, 1000), phase(SAT, 0.1, 15000), phase(3, 0.6, 10000),
-              phase(SAT, 0.9, 100), phase(0.5, 0.1, 10000), phase(SAT, 0.6, 10000)],
     # MICA (--app mica) forwards about twice nf-chain's rate on a core: the
     # flows and ramp scenarios at twice the rates
-    "mica-flows-rate6": [phase(6.0, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
     "mica-flows-rate7": [phase(7.0, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
     "mica-ramp": [phase(2 * r) for r in (0.5, 1, 1.5, 2, 2.5, 3, 3.25, 3.5, 3.25, 3, 2.5, 2, 1, 0.5)],
 }

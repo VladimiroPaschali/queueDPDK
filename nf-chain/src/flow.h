@@ -10,7 +10,3 @@ struct FlowId {
   uint16_t internal_device;
   uint8_t protocol;
 };
-
-/* The Shared variant stored FlowIds without the trailing padding byte. Field
- * offsets are the same, only the per-entry stride of the flow vector changes. */
-#define FLOWID_PACKED_SIZE (offsetof(struct FlowId, protocol) + sizeof(uint8_t))

@@ -14,8 +14,6 @@
  *                                                           poll queue Q once every P regular polls,
  *                                                           on top of the base policy
  * Partitioned         --multicore partitioned              each lcore polls a disjoint slice of queues
- * Shared              --multicore shared                   every lcore polls every queue, guarded by
- *                                                           a per-queue spinlock
  */
 #pragma once
 
@@ -33,7 +31,6 @@
 enum qflow_mode {
 	QFLOW_SINGLE,
 	QFLOW_PARTITIONED,
-	QFLOW_SHARED,
 };
 
 struct qflow_opts {
@@ -67,7 +64,7 @@ struct qflow_opts {
 	"  --" QFLOW_OPT_LATENCY_QUEUE " Q: enable the Latency policy on queue Q\n"                    \
 	"  --" QFLOW_OPT_LATENCY_PERIOD " P: poll the latency queue every P regular polls (default "   \
 	"4)\n"                                                                                         \
-	"  --" QFLOW_OPT_MULTICORE " partitioned|shared: required with more than one lcore\n"
+	"  --" QFLOW_OPT_MULTICORE " partitioned: required with more than one lcore\n"
 
 static inline void
 qflow_opts_init(struct qflow_opts *o)
@@ -141,8 +138,6 @@ qflow_parse_long_opt(struct qflow_opts *o, const char *name, const char *arg)
 	if (strcmp(name, QFLOW_OPT_MULTICORE) == 0) {
 		if (strcmp(arg, "partitioned") == 0)
 			o->mode = QFLOW_PARTITIONED;
-		else if (strcmp(arg, "shared") == 0)
-			o->mode = QFLOW_SHARED;
 		else {
 			printf("unknown multicore policy: %s\n", arg);
 			return -1;
@@ -156,7 +151,7 @@ static inline int
 qflow_check(const struct qflow_opts *o, unsigned queues, unsigned nb_lcores)
 {
 	if (o->mode == QFLOW_SINGLE && nb_lcores > 1) {
-		printf("%u lcores given: select --" QFLOW_OPT_MULTICORE " partitioned|shared\n",
+		printf("%u lcores given: select --" QFLOW_OPT_MULTICORE " partitioned\n",
 		       nb_lcores);
 		return -1;
 	}
@@ -179,8 +174,6 @@ qflow_mode_name(enum qflow_mode mode)
 	switch (mode) {
 	case QFLOW_PARTITIONED:
 		return "partitioned";
-	case QFLOW_SHARED:
-		return "shared";
 	default:
 		return "single";
 	}
