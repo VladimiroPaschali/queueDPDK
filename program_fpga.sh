@@ -1,5 +1,6 @@
 #!/bin/bash
-# Program the Alveo with the QueueDPDK bitstream, re-enumerate it on PCIe and
+# Program the Alveo with the QueueDPDK bitstream (extended_table_prefetch.bit, the
+# one of the paper: 64-queue C2H prefetch cache), re-enumerate it on PCIe and
 # bind it to vfio-pci with the Open-NIC registers set (same as ports.sh).
 #
 # Usage: sudo ./program_fpga.sh [bitstream.bit]
@@ -17,7 +18,7 @@ if [ "${1:-}" = "--no-program" ]; then
 	PROGRAM=0
 	shift
 fi
-BITSTREAM="$(realpath "${1:-$DIR/extended_table.bit}")"
+BITSTREAM="$(realpath "${1:-$DIR/extended_table_prefetch.bit}")"
 XSDB=/home/andrea/Xilinx/Vitis/2024.1/bin/xsdb
 PCIMEM=/home/andrea/pcimem/pcimem
 DEVBIND="$DIR/../dpdk-20.11/usertools/dpdk-devbind.py"
