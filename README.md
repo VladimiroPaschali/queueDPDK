@@ -53,6 +53,8 @@ vivado -mode batch -nojournal -nolog -source mkmcs.tcl -tclargs extended_table_p
 ```
 cd nf-chain && make               # build/nf-chain
 cd mica && make                   # build/mica-fifo-nocopy-{prefetch,pools-prefetch,prefetch-lat,prefetch-qprobe,prefetch-adaptive}
+                                  # (needs an AVX-512 CPU; make clean && make MICA_HT=0 builds the MICA without
+                                  # the header prefetch and the vector tag comparison)
 cd experiments/apps/starvation && make   # build/starvation (nf-chain + poll log)
 cd experiments/apps/adaptive && make     # build/adaptive (nf-chain + adaptive queue count)
 cd experiments/apps/locality && make     # build/cms (distinct flows per burst)
@@ -105,6 +107,10 @@ The `trap : INT` and `tee -i` keep a C-c from killing the shell around the Pytho
 | latency against the queues, Pareto frontier | `latency` | `run_latency.sh <app>` | `latency/results_latency_{nf-chain,mica-prefetch}-pfch64_skew0.6` | `latency/` |
 | starvation (flow completion time) | `starvation` | `run_starvation.sh <app>` | `starvation/<app>-pfch64` | `starvation/` |
 | adaptive (changing load, changing flows) | `adaptive` | `run_adaptive.sh <app>` | `adaptive/<app>-pfch64` | `adaptive/` |
+
+The two apps do not run the same policies and sweeps. MICA: Round-Robin and Aggressive on 1 core, Aggressive on 2 and 4 cores; latency in 0.25 Mpps steps (`--stop-loss 5`, the loads of the panels, 1.8, 4.6 and 6.2 Mpps, always measured, 6.2 three times); adaptive scenarios `mica-flows-rate8` and `mica-ramp-max9` against 1 and 128 queues. nf-chain: Round-Robin, Penalty and Aggressive+Penalty on 1 core, Aggressive+Penalty on 2 and 4 cores; latency in 0.1 Mpps steps; adaptive scenarios `flows-rate35` and `ramp` against 1, 16, 128 and 2048 queues.
+
+`--resume` takes the points already in a results folder as done, whatever build measured them: before a new run move away the results of a different build (for MICA, those of a build with `MICA_HT=0`).
 
 Two measurements of the paper have no script: the 16 ns per queue of the Motivation (an L2 forwarding application at 500 pps, with 1 to 2048 queues) and the LLC-to-DRAM traffic of the Discussion, taken with `experiments/pqos.py` (Intel PQoS) while an app runs.
 

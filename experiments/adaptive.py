@@ -140,6 +140,11 @@ SCENARIOS = {
     # flows and ramp scenarios at twice the rates
     "mica-flows-rate7": [phase(7.0, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
     "mica-ramp": [phase(2 * r) for r in (0.5, 1, 1.5, 2, 2.5, 3, 3.25, 3.5, 3.25, 3, 2.5, 2, 1, 0.5)],
+    # the MICA of the paper (header prefetch and AVX-512 tag comparison, mica/Makefile), about 1 Mpps faster per core than
+    # the 7 Mpps scenarios above assume (those are for a build with MICA_HT=0): up to 8 and 9 Mpps, above what 128 fixed
+    # queues take (NDR 7.9 at skew 0.6) and within reach of 512 to 1024 (8.8, 9.1)
+    "mica-flows-rate8": [phase(8.0, flows=f) for f in (100, 1000, 5000, 10000, 15000, 5000, 1000, 100)],
+    "mica-ramp-max9": [phase(r) for r in (3, 4, 5, 6, 7, 8, 8.5, 9, 8.5, 8, 7, 6, 5, 4, 3)],
 }
 
 NUM = r"([\d.,']+)"
@@ -314,6 +319,18 @@ class Traffic:
             self.active = n
             return 0.0
         t = time.monotonic()
+        self.load(ph, superset)
+        self.client.start(ports=PORTS, mult=mult, force=True)
+        self.running = True
+        return time.monotonic() - t
+
+    def load(self, ph, superset):
+        """Put the streams of phase ph on the (stopped) port without starting them. Loading takes 3-5 s the first
+        time a stream set is added: run_scenario does it before the app starts, so that the first apply() of
+        every run only starts the traffic and the phases of the runs begin at the same time."""
+        key = self.key(ph, superset)
+        streams = self.streams(key)
+        n = min(ph["flows"], key[1])
         # a restart keeps the start_paused flags of the load, not the pauses since
         if key != self.loaded or not (n == self.start_n == self.active):
             self.stop()
@@ -322,9 +339,6 @@ class Traffic:
                 s.fields["start_paused"] = i >= n
             ids = self.client.add_streams(streams + self.probe_streams(key[2]), ports=PORTS)
             self.ids, self.loaded, self.start_n, self.active = ids[:len(streams)], key, n, n
-        self.client.start(ports=PORTS, mult=mult, force=True)
-        self.running = True
-        return time.monotonic() - t
 
 
 def read_probes(client, pg_ids):
@@ -413,6 +427,8 @@ def run_scenario(client, traffic, args, scenario, policy, mode, variant, rep, wr
         if ph["rate"] > 0:
             traffic.streams(traffic.key(ph, flows_of(ph)))
     traffic.stop()
+    if phases[0]["rate"] > 0:
+        traffic.load(phases[0], flows_of(phases[0]))
 
     proc = launch_app(app_args)
     samples, bounds = [], []

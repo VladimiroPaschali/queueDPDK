@@ -3,7 +3,11 @@
 # frontier of p99 latency against zero-loss throughput) for one app, results tagged
 # -$TAG: every queue count, the 4 policies of latency.py (round robin, aggressive,
 # latency, latency+aggressive), skew 0.6, from 1 Mpps to 0.5 Mpps above the highest
-# zero-loss rate of the app's NDR run with the same tag (run_ndr.sh), in steps of 0.1.
+# zero-loss rate of the app's NDR run with the same tag (run_ndr.sh). nf-chain in steps of
+# 0.1. MICA in steps of 0.25, no more rates for a (queues, policy) once a sample loses over
+# 5% of the packets, the loads of the figure panels (1.8, 4.6, 6.2 Mpps) always measured,
+# and 6.2 Mpps three times (a single 5 s sample of 8 to 128 queues is erratic at the knee
+# of the curve; the plots average the repetitions).
 #
 #   ./run_latency.sh mica
 #   ./run_latency.sh nf-chain
@@ -13,10 +17,12 @@ app_names "$app"
 case $app in
 mica)
 	lat_app=mica-prefetch
+	SWEEP=(--step 0.25 --stop-loss 5 --rates 1.8 4.6 6.2)
 	run make -C ../mica
 	mica_cleanup ;;
 nf-chain)
 	lat_app=nf-chain
+	SWEEP=(--step 0.1)
 	run make -C ../nf-chain ;;
 esac
 ndr=results/ndr/results_${SINGLE}-${TAG}_skew0.6/benchmark_results.csv
@@ -37,5 +43,11 @@ if [ ! -f "$discover/latency_results.csv" ]; then
 	run python3 latency.py --app nf-chain --rediscover --policies baseline --min 1.0 --max 1.0 \
 		--bitstream "$TAG" --output "$discover"
 fi
-run python3 latency.py --app "$lat_app" --bitstream "$TAG" --min 1.0 --max "$max" --step 0.1 --skew 0.6 \
-	--resume --output "results/latency/results_latency_${lat_app}-${TAG}_skew0.6"
+out=results/latency/results_latency_${lat_app}-${TAG}_skew0.6
+run python3 latency.py --app "$lat_app" --bitstream "$TAG" --min 1.0 --max "$max" "${SWEEP[@]}" --skew 0.6 \
+	--resume --output "$out"
+if [ "$app" = mica ]; then
+	# repetitions 2 and 3 of 6.2 Mpps (the first is in the sweep above)
+	run python3 latency.py --app "$lat_app" --bitstream "$TAG" --min 6.2 --max 6.2 --repetitions 3 --skew 0.6 \
+		--resume --output "$out"
+fi

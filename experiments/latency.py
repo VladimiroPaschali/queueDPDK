@@ -378,6 +378,12 @@ def main():
     parser.add_argument("--min", type=float, default=1.0, help="lowest rate in Mpps")
     parser.add_argument("--max", type=float, default=5.0, help="highest rate in Mpps")
     parser.add_argument("--step", type=float, default=0.5, help="rate step in Mpps")
+    parser.add_argument("--rates", type=float, nargs="+",
+                        help="rates in Mpps always measured on top of the range (the loads of the figure panels), "
+                        "whatever --stop-loss says")
+    parser.add_argument("--stop-loss", type=float, metavar="PCT",
+                        help="stop raising the rate of a (queues, policy) once a sample loses more than PCT percent "
+                        "of the packets: the higher rates only lose more (the --rates are measured anyway)")
     parser.add_argument("--skew", type=float, default=0.6, help="Zipf skew of the load")
     parser.add_argument("--flows", type=int, default=10000)
     parser.add_argument("--probe-pps", type=int, default=1000, help="rate of the latency probe")
@@ -398,7 +404,8 @@ def main():
     APP = APPS[args.app]
     name = args.app
 
-    rates = rate_range(args.min, args.max, args.step)
+    extra = {round(r, 3) for r in (args.rates or [])}
+    rates = sorted({round(r, 3) for r in rate_range(args.min, args.max, args.step)} | extra)
     results_dir = os.path.join(HERE, args.output or os.path.join("results", "latency",
                                                                  f"results_latency_{name}_skew{args.skew}"))
     os.makedirs(results_dir, exist_ok=True)
@@ -422,12 +429,21 @@ def main():
                 todo = [(rate, rep) for rate in rates for rep in range(1, args.repetitions + 1)
                         if (queues, policy, round(rate, 3), rep) not in done]
                 pbar.update(len(rates) * args.repetitions - len(todo))
+                # a resumed run: the lowest rate already above --stop-loss ends the sweep of this pair too
+                stopped_at = None
+                if args.stop_loss is not None:
+                    stopped_at = min((r["rate_mpps"] for r in rows if r["queues"] == queues and r["policy"] == policy
+                                      and r["loss_pct"] > args.stop_loss), default=None)
+                    todo = [(rate, rep) for rate, rep in todo
+                            if stopped_at is None or rate <= stopped_at or round(rate, 3) in extra]
                 if not todo:
                     continue
                 app_args = f"-q {queues} " + POLICIES[policy].format(q=lat_queue[queues])
                 proc = launch_app(app_args)
                 try:
                     for rate, rep in todo:
+                        if stopped_at is not None and rate > stopped_at and round(rate, 3) not in extra:
+                            continue
                         pbar.set_description(f"Q={queues:4d} {policy:26} {rate:.2f} Mpps")
                         r = measure(client, rate, args.warmup, args.duration)
                         r.update(queues=queues, policy=policy, latency_queue=lat_queue[queues],
@@ -440,6 +456,8 @@ def main():
                             f"probe {r['probe_rx']:.0f}/{r['probe_tx']:.0f}"
                         )
                         pbar.update(1)
+                        if args.stop_loss is not None and stopped_at is None and r["loss_pct"] > args.stop_loss:
+                            stopped_at = rate
                 finally:
                     client.stop(ports=PORTS)
                     stop_app(proc)
