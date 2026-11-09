@@ -24,6 +24,18 @@ LDFLAGS += -Wl,--as-needed -Wl,--no-undefined -Wl,-O1 \
 	-pthread -lm -ldl -lnuma -lpcap -lcrypto -lz -lelf -lbsd -libverbs \
 	$(shell pkg-config --libs jansson 2>/dev/null)  # librte_metrics telemetry, if DPDK was configured with jansson
 
+# Two changes of MICA's request pipeline, on by default (MICA_HT=0 builds the original
+# without them; run make clean when it changes):
+#  MICA_PF_HDR   the packet headers of the burst are prefetched before the keys are hashed
+#                (main.c)
+#  MICA_TAGMASK  the bucket tags are compared as one AVX-512 vector instead of a loop with a
+#                branch per slot (ported-mica/table.c); the host CPU needs AVX-512
+#                (-march=native)
+MICA_HT ?= 1
+ifeq ($(MICA_HT),1)
+CFLAGS += -DMICA_PF_HDR -DMICA_TAGMASK
+endif
+
 # Every build is the MICA of the paper: true FIFO eviction, no copy of the
 # 1400-byte value into the RX buffer, and MICA's request pipeline (prefetch
 # the bucket, then the item, then run the burst); see main.c.

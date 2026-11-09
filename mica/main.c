@@ -408,6 +408,13 @@ mica_process_burst_prefetch(struct rte_mbuf **pkts_burst, int nb_pkts, const enu
 	uint64_t                        hashes[MAX_PKT_BURST];
 	struct mehcached_prefetch_state pf[MAX_PKT_BURST];
 
+#ifdef MICA_PF_HDR
+	/* The first touch of a packet header (mica_key) is an L2 miss served by the LLC where
+	 * the NIC wrote it, about one per packet and not overlapped: prefetching the headers of
+	 * the whole burst first overlaps them */
+	for (int i = 0; i < nb_pkts; i++)
+		rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[i], void *));
+#endif
 	for (int i = 0; i < nb_pkts; i++) {
 		hashes[i] = mica_key(rte_pktmbuf_mtod(pkts_burst[i], uint8_t *), &keys[i]);
 		mehcached_prefetch_table(table, hashes[i], &pf[i]);

@@ -20,6 +20,29 @@ MEHCACHED_BEGIN
 // a test feature to deduplicate PUT requests within the same batch
 //#define MEHCACHED_DEDUP_WITHIN_BATCH
 
+#ifdef MICA_TAGMASK
+// The scan of a bucket for the items with a given tag (mehcached_prefetch_alloc and
+// mehcached_find_item_index, run for every request) as one vector comparison, no branch per slot.
+// The loop it replaces leaves at the slot that matches, which depends on the key: a mispredicted
+// branch per scan, two per request. bit k of the result: item_vec[k] has this tag. Needs AVX-512.
+#include <immintrin.h>
+_Static_assert(MEHCACHED_ITEMS_PER_BUCKET == 15 && sizeof(struct mehcached_bucket) == 128,
+               "mehcached_tag_mask reads the 128 bytes of a bucket: version|next_extra_bucket_index, item_vec[15]");
+
+static inline uint32_t
+mehcached_tag_mask(const struct mehcached_bucket *bucket, uint16_t tag)
+{
+    const __m512i wanted = _mm512_set1_epi64((long long)tag);
+    // words 0..7 = version|next_extra_bucket_index, item_vec[0..6]; words 8..15 = item_vec[7..14]
+    const __m512i lo = _mm512_loadu_si512((const void *)bucket);
+    const __m512i hi = _mm512_loadu_si512((const void *)((const uint8_t *)bucket + 64));
+    // the tag is the top 16 bits of an item_vec word (MEHCACHED_TAG)
+    const uint32_t m = (uint32_t)_mm512_cmpeq_epi64_mask(_mm512_srli_epi64(lo, 48), wanted) |
+                       ((uint32_t)_mm512_cmpeq_epi64_mask(_mm512_srli_epi64(hi, 48), wanted) << 8);
+    return (m >> 1) & ((1u << MEHCACHED_ITEMS_PER_BUCKET) - 1);  // drop word 0: it is not an item
+}
+#endif
+
  
 void
 mehcached_print_bucket(const struct mehcached_bucket *bucket)
@@ -470,10 +493,16 @@ mehcached_find_item_index(const struct mehcached_table *table, struct mehcached_
     while (true)
     {
         size_t item_index;
+#ifdef MICA_TAGMASK
+        for (uint32_t tag_mask = mehcached_tag_mask(current_bucket, tag); tag_mask != 0; tag_mask &= tag_mask - 1)
+        {
+            item_index = (size_t)__builtin_ctz(tag_mask);
+#else
         for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
         {
             if (MEHCACHED_TAG(current_bucket->item_vec[item_index]) != tag)
                 continue;
+#endif
 
             // we may read garbage values, which do not cause any fatal issue
     #ifdef MEHCACHED_ALLOC_POOL
@@ -637,10 +666,16 @@ mehcached_prefetch_alloc(struct mehcached_prefetch_state *in_out_prefetch_state)
     uint16_t tag = mehcached_calc_tag(prefetch_state->key_hash);
 
     size_t item_index;
+#ifdef MICA_TAGMASK
+    for (uint32_t tag_mask = mehcached_tag_mask(bucket, tag); tag_mask != 0; tag_mask &= tag_mask - 1)
+    {
+        item_index = (size_t)__builtin_ctz(tag_mask);
+#else
     for (item_index = 0; item_index < MEHCACHED_ITEMS_PER_BUCKET; item_index++)
     {
         if (MEHCACHED_TAG(bucket->item_vec[item_index]) != tag)
             continue;
+#endif
 
 #ifdef MEHCACHED_ALLOC_POOL
         uint8_t alloc_id = MEHCACHED_ALLOC_ID(bucket->item_vec[item_index]);
